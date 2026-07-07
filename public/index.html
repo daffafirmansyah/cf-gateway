@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CF Gateway</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { font-family: 'Inter', system-ui, sans-serif; }
+    body { background: #050508; color: #e2e8f0; min-height: 100vh; }
+    
+    /* Animated gradient bg */
+    .bg-mesh {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% 0%, rgba(59,130,246,.08) 0%, transparent 50%),
+        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(139,92,246,.06) 0%, transparent 50%);
+    }
+    
+    /* Glass card */
+    .glass {
+      background: rgba(17,24,39,.6);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255,255,255,.06);
+      border-radius: 16px;
+    }
+    .glass-sm {
+      background: rgba(17,24,39,.5);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255,255,255,.05);
+      border-radius: 12px;
+    }
+
+    /* Login overlay */
+    #login-overlay {
+      position: fixed; inset: 0; z-index: 100;
+      display: flex; align-items: center; justify-content: center;
+      background: #050508;
+      transition: opacity .5s, visibility .5s;
+    }
+    #login-overlay.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+    #login-card {
+      width: 400px; max-width: 90vw;
+      background: rgba(17,24,39,.8);
+      backdrop-filter: blur(24px);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 20px;
+      padding: 40px 36px;
+      text-align: center;
+      transform: translateY(0);
+      transition: transform .4s cubic-bezier(.16,1,.3,1);
+    }
+    #login-overlay:not(.hidden) #login-card { transform: translateY(0); }
+    
+    .key-icon {
+      width: 64px; height: 64px; margin: 0 auto 20px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border-radius: 16px; display: flex; align-items: center; justify-content: center;
+      font-size: 28px;
+      box-shadow: 0 8px 32px rgba(59,130,246,.25);
+    }
+    
+    .input-key {
+      width: 100%; padding: 14px 16px;
+      background: rgba(0,0,0,.3);
+      border: 1px solid rgba(255,255,255,.1);
+      border-radius: 12px;
+      color: #e2e8f0; font-size: 14px;
+      outline: none;
+      transition: border-color .2s, box-shadow .2s;
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+    .input-key:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59,130,246,.15);
+    }
+    .input-key.error {
+      border-color: #ef4444;
+      box-shadow: 0 0 0 3px rgba(239,68,68,.15);
+      animation: shake .4s;
+    }
+    
+    @keyframes shake {
+      0%,100% { transform: translateX(0); }
+      20%,60% { transform: translateX(-6px); }
+      40%,80% { transform: translateX(6px); }
+    }
+    
+    .btn-primary {
+      width: 100%; padding: 14px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      border: none; border-radius: 12px;
+      color: white; font-weight: 600; font-size: 14px;
+      cursor: pointer;
+      transition: opacity .2s, transform .1s;
+      margin-top: 12px;
+    }
+    .btn-primary:hover { opacity: .9; }
+    .btn-primary:active { transform: scale(.98); }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+
+    .login-error {
+      color: #f87171; font-size: 12px; margin-top: 8px; min-height: 18px;
+    }
+    
+    /* Stat card hover */
+    .stat-card {
+      background: rgba(17,24,39,.5);
+      border: 1px solid rgba(255,255,255,.05);
+      border-radius: 14px;
+      padding: 20px;
+      transition: border-color .2s, transform .15s;
+    }
+    .stat-card:hover {
+      border-color: rgba(255,255,255,.1);
+      transform: translateY(-2px);
+    }
+    .stat-card .stat-value {
+      font-size: 28px; font-weight: 700; line-height: 1;
+      margin-top: 6px;
+    }
+    .stat-card .stat-label {
+      font-size: 11px; font-weight: 500; text-transform: uppercase;
+      letter-spacing: .05em; color: #64748b;
+    }
+    .stat-card .stat-icon {
+      width: 36px; height: 36px; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px; margin-bottom: 10px;
+    }
+
+    /* Progress bar */
+    .bar-bg { background: rgba(255,255,255,.05); border-radius: 6px; overflow: hidden; height: 8px; }
+    .bar-fill { height: 100%; border-radius: 6px; transition: width .6s cubic-bezier(.16,1,.3,1); }
+
+    /* Badge */
+    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 8px; font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+    .badge-green { background: rgba(16,185,129,.12); color: #6ee7b7; }
+    .badge-yellow { background: rgba(234,179,8,.12); color: #fcd34d; }
+    .badge-red { background: rgba(239,68,68,.1); color: #fca5a5; }
+    .badge-gray { background: rgba(107,114,128,.12); color: #9ca3af; }
+
+    /* Status dot */
+    .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+    .dot-green { background: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,.4); }
+    .dot-yellow { background: #eab308; box-shadow: 0 0 6px rgba(234,179,8,.4); }
+    .dot-red { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,.4); }
+    .dot-gray { background: #6b7280; }
+
+    /* Table */
+    table { border-collapse: separate; border-spacing: 0; width: 100%; }
+    th { position: sticky; top: 0; background: rgba(15,23,42,.95); backdrop-filter: blur(8px); z-index: 10;
+         font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #475569;
+         padding: 10px 14px; text-align: left; border-bottom: 1px solid rgba(255,255,255,.05); }
+    td { padding: 10px 14px; font-size: 13px; border-bottom: 1px solid rgba(255,255,255,.03); }
+    tr:hover td { background: rgba(59,130,246,.04); }
+    tbody tr { transition: background .15s; }
+
+    /* Tabs */
+    .tab-btn {
+      padding: 10px 20px; border-radius: 10px 10px 0 0;
+      font-weight: 600; font-size: 13px; cursor: pointer;
+      color: #475569; transition: all .2s;
+      border: 1px solid transparent; border-bottom: none;
+    }
+    .tab-btn.active {
+      background: rgba(17,24,39,.6);
+      color: #60a5fa;
+      border-color: rgba(255,255,255,.06);
+    }
+    .tab-btn:not(.active):hover { color: #94a3b8; }
+
+    /* Logs */
+    .log-entry {
+      background: rgba(15,23,42,.5);
+      border: 1px solid rgba(255,255,255,.04);
+      border-radius: 10px; padding: 12px 16px;
+      margin-bottom: 6px; font-size: 12px;
+      transition: border-color .15s;
+    }
+    .log-entry:hover { border-color: rgba(255,255,255,.08); }
+
+    /* Search input */
+    .search-input {
+      background: rgba(0,0,0,.3);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 10px; padding: 8px 14px;
+      font-size: 13px; color: #e2e8f0; width: 260px;
+      outline: none; transition: border-color .2s, box-shadow .2s;
+    }
+    .search-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,.1); }
+    .search-input::placeholder { color: #475569; }
+
+    .filter-select {
+      background: rgba(0,0,0,.3);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 10px; padding: 8px 12px;
+      font-size: 13px; color: #e2e8f0;
+      outline: none; cursor: pointer;
+    }
+    .filter-select option { background: #111827; }
+
+    /* Pulse animation for live dot */
+    @keyframes livePulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+    .live-pulse { animation: livePulse 2s ease-in-out infinite; }
+
+    /* Fade in */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .fade-up { animation: fadeUp .5s cubic-bezier(.16,1,.3,1) forwards; opacity: 0; }
+    .fade-up:nth-child(1) { animation-delay: .05s; }
+    .fade-up:nth-child(2) { animation-delay: .1s; }
+    .fade-up:nth-child(3) { animation-delay: .15s; }
+    .fade-up:nth-child(4) { animation-delay: .2s; }
+    .fade-up:nth-child(5) { animation-delay: .25s; }
+    .fade-up:nth-child(6) { animation-delay: .3s; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,.15); }
+
+    /* Button styles */
+    .btn-ghost {
+      padding: 8px 16px; border-radius: 10px;
+      font-size: 13px; font-weight: 500; cursor: pointer;
+      background: transparent; border: 1px solid rgba(255,255,255,.08);
+      color: #94a3b8; transition: all .15s;
+    }
+    .btn-ghost:hover { background: rgba(255,255,255,.05); color: #e2e8f0; border-color: rgba(255,255,255,.12); }
+    .btn-danger { color: #f87171; border-color: rgba(239,68,68,.15); }
+    .btn-danger:hover { background: rgba(239,68,68,.08); border-color: rgba(239,68,68,.25); }
+
+    .btn-accent {
+      padding: 8px 18px; border-radius: 10px;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      border: none; color: white;
+      transition: opacity .15s, transform .1s;
+    }
+    .btn-accent:hover { opacity: .9; }
+    .btn-accent:active { transform: scale(.97); }
+  </style>
+</head>
+<body>
+  <div class="bg-mesh"></div>
+
+  <!-- LOGIN OVERLAY -->
+  <div id="login-overlay">
+    <div class="bg-mesh"></div>
+    <div id="login-card" style="position:relative; z-index:1;">
+      <div class="key-icon">🔑</div>
+      <h2 style="font-size:22px; font-weight:700; color:#fff; margin-bottom:6px;">CF Gateway</h2>
+      <p style="font-size:13px; color:#64748b; margin-bottom:28px;">Enter your API key to access the dashboard</p>
+      <form id="login-form" onsubmit="handleLogin(event)">
+        <input type="password" id="key-input" class="input-key" placeholder="cfgw_xxxxxxxxxxxx" autocomplete="off" spellcheck="false">
+        <div id="login-error" class="login-error"></div>
+        <button type="submit" id="login-btn" class="btn-primary">Connect</button>
+      </form>
+      <p style="font-size:11px; color:#334155; margin-top:20px;">Key is stored locally in your browser</p>
+    </div>
+  </div>
+
+  <!-- MAIN DASHBOARD -->
+  <div id="dashboard" class="relative z-10 max-w-7xl mx-auto px-4 py-6" style="display:none;">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-8 fade-up">
+      <div>
+        <h1 style="font-size:26px; font-weight:700; color:#fff; display:flex; align-items:center; gap:10px;">
+          <span style="background:linear-gradient(135deg,#3b82f6,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">⚡</span>
+          CF Gateway
+        </h1>
+        <p style="font-size:13px; color:#475569; margin-top:2px;">Cloudflare Workers AI Proxy — 1001 Account Pool</p>
+      </div>
+      <div class="flex items-center gap-3">
+        <span id="conn-status" class="text-xs" style="color:#475569;">connecting...</span>
+        <button onclick="importAccounts()" class="btn-accent">↻ Import</button>
+        <button onclick="logout()" class="btn-ghost btn-danger" title="Logout">⏏</button>
+      </div>
+    </div>
+
+    <!-- Stats Grid -->
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+      <div class="stat-card fade-up">
+        <div class="stat-icon" style="background:rgba(59,130,246,.1);color:#60a5fa;">📊</div>
+        <div class="stat-label">Total</div>
+        <div id="stat-total" class="stat-value text-white">—</div>
+      </div>
+      <div class="stat-card fade-up">
+        <div class="stat-icon" style="background:rgba(16,185,129,.1);color:#6ee7b7;">✓</div>
+        <div class="stat-label">Available</div>
+        <div id="stat-available" class="stat-value text-green-400">—</div>
+      </div>
+      <div class="stat-card fade-up">
+        <div class="stat-icon" style="background:rgba(234,179,8,.1);color:#fcd34d;">⏳</div>
+        <div class="stat-label">Cooldown</div>
+        <div id="stat-cooldown" class="stat-value text-yellow-400">—</div>
+      </div>
+      <div class="stat-card fade-up">
+        <div class="stat-icon" style="background:rgba(99,102,241,.1);color:#a5b4fc;">⚡</div>
+        <div class="stat-label">Used Today</div>
+        <div id="stat-neurons-used" class="stat-value text-indigo-400">—</div>
+      </div>
+      <div class="stat-card fade-up">
+        <div class="stat-icon" style="background:rgba(139,92,246,.1);color:#c4b5fd;">♾</div>
+        <div class="stat-label">Remaining</div>
+        <div id="stat-neurons-remaining" class="stat-value text-purple-400">—</div>
+      </div>
+      <div class="stat-card fade-up">
+        <div class="stat-icon" style="background:rgba(244,114,182,.1);color:#f9a8d4;">📡</div>
+        <div class="stat-label">Requests</div>
+        <div id="stat-requests" class="stat-value text-pink-400">—</div>
+      </div>
+    </div>
+
+    <!-- Neuron Usage Bar -->
+    <div class="glass-sm p-5 mb-6 fade-up">
+      <div class="flex justify-between items-center mb-3">
+        <span style="font-size:13px; font-weight:600; color:#94a3b8;">Daily Neuron Budget</span>
+        <span id="neuron-pct" style="font-size:12px; color:#64748b; font-family:monospace;">—</span>
+      </div>
+      <div class="bar-bg" style="height:10px;">
+        <div id="neuron-bar" class="bar-fill" style="width:0%; background:linear-gradient(90deg,#3b82f6,#8b5cf6);"></div>
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex gap-1 mb-0 relative z-10">
+      <div class="tab-btn active" onclick="switchTab('accounts')">Accounts</div>
+      <div class="tab-btn" onclick="switchTab('logs')">Request Logs</div>
+    </div>
+
+    <!-- Accounts Panel -->
+    <div id="tab-accounts" class="glass rounded-t-none p-5" style="border-top-left-radius:0;">
+      <div class="flex justify-between items-center mb-4">
+        <div class="flex gap-3 items-center">
+          <input id="search" type="text" placeholder="Search name or ID..." oninput="renderAccounts()" class="search-input">
+          <select id="filter-status" onchange="renderAccounts()" class="filter-select">
+            <option value="">All Status</option>
+            <option value="available">Available</option>
+            <option value="cooldown">Cooldown</option>
+            <option value="exhausted">Exhausted</option>
+            <option value="inactive">Inactive</option>
+          </select>
+        </div>
+        <div style="font-size:12px; color:#475569;" id="account-count">—</div>
+      </div>
+      <div style="max-height:60vh; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>Name</th><th>Account ID</th><th>Status</th>
+              <th>Neurons Used</th><th>Budget</th><th>Requests</th><th>Cooldown</th>
+            </tr>
+          </thead>
+          <tbody id="accounts-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Logs Panel -->
+    <div id="tab-logs" class="glass rounded-t-none p-5 hidden" style="border-top-left-radius:0;">
+      <div class="flex justify-between items-center mb-4">
+        <span style="font-size:13px; color:#94a3b8;">Recent Requests <span style="color:#475569;">(last 500)</span></span>
+        <button onclick="clearLogs()" class="btn-ghost btn-danger" style="font-size:12px; padding:6px 12px;">Clear</button>
+      </div>
+      <div id="logs-container" style="max-height:60vh; overflow-y:auto;"></div>
+    </div>
+
+  </div>
+
+  <script>
+    let accounts = [];
+    let stats = {};
+    let logs = [];
+
+    // ─── Auth ───
+    function getApiKey() { return localStorage.getItem('cf_api_key') || ''; }
+    function setApiKey(k) { localStorage.setItem('cf_api_key', k); }
+    function clearApiKey() { localStorage.removeItem('cf_api_key'); }
+
+    function authHeaders(extra = {}) {
+      const k = getApiKey();
+      return k ? { ...extra, 'Authorization': `Bearer ${k}` } : extra;
+    }
+
+    async function authedFetch(url, opts = {}) {
+      return fetch(url, { ...opts, headers: authHeaders(opts.headers || {}) });
+    }
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      const input = document.getElementById('key-input');
+      const btn = document.getElementById('login-btn');
+      const err = document.getElementById('login-error');
+      const key = input.value.trim();
+      if (!key) { input.classList.add('error'); err.textContent = 'Please enter your API key'; setTimeout(() => input.classList.remove('error'), 500); return; }
+
+      btn.disabled = true;
+      btn.textContent = 'Verifying...';
+      err.textContent = '';
+
+      try {
+        setApiKey(key);
+        const res = await authedFetch('/api/stats');
+        if (res.ok) {
+          document.getElementById('login-overlay').classList.add('hidden');
+          document.getElementById('dashboard').style.display = 'block';
+          fetchData();
+        } else {
+          clearApiKey();
+          input.classList.add('error');
+          err.textContent = 'Invalid API key';
+          setTimeout(() => input.classList.remove('error'), 500);
+        }
+      } catch (e) {
+        clearApiKey();
+        err.textContent = 'Connection failed';
+      }
+      btn.disabled = false;
+      btn.textContent = 'Connect';
+    }
+
+    function logout() {
+      clearApiKey();
+      location.reload();
+    }
+
+    // ─── Init ───
+    (function init() {
+      const key = getApiKey();
+      if (!key) return;
+      authedFetch('/api/stats').then(res => {
+        if (res.ok) {
+          document.getElementById('login-overlay').classList.add('hidden');
+          document.getElementById('dashboard').style.display = 'block';
+          fetchData();
+        } else {
+          clearApiKey();
+        }
+      }).catch(() => clearApiKey());
+    })();
+
+    // ─── Helpers ───
+    function formatNum(n) {
+      if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return String(n);
+    }
+
+    function statusBadge(s) {
+      const m = { available:'badge-green', cooldown:'badge-yellow', exhausted:'badge-red', inactive:'badge-gray' };
+      return `<span class="badge ${m[s]||'badge-gray'}">${s}</span>`;
+    }
+    function statusDot(s) {
+      const m = { available:'dot-green', cooldown:'dot-yellow', exhausted:'dot-red', inactive:'dot-gray' };
+      return `<span class="dot ${m[s]||'dot-gray'}"></span>`;
+    }
+    function neuronBar(used, total) {
+      const pct = total > 0 ? Math.min(100, (used/total)*100) : 0;
+      const c = pct > 90 ? '#ef4444' : pct > 70 ? '#eab308' : '#3b82f6';
+      return `<div class="bar-bg"><div class="bar-fill" style="width:${pct}%;background:${c};"></div></div>`;
+    }
+
+    // ─── Render ───
+    function renderAccounts() {
+      const search = document.getElementById('search').value.toLowerCase();
+      const filter = document.getElementById('filter-status').value;
+      let f = accounts;
+      if (search) f = f.filter(a => a.name.toLowerCase().includes(search) || a.account_id.toLowerCase().includes(search));
+      if (filter) f = f.filter(a => a.status === filter);
+      document.getElementById('account-count').textContent = `${f.length} / ${accounts.length} accounts`;
+      document.getElementById('accounts-body').innerHTML = f.map(a => `
+        <tr>
+          <td style="color:#475569;">${a.id}</td>
+          <td style="font-weight:500;">${a.name}</td>
+          <td style="color:#64748b; font-family:monospace; font-size:12px;">${a.account_id}…</td>
+          <td><div style="display:flex;align-items:center;gap:6px;">${statusDot(a.status)}${statusBadge(a.status)}</div></td>
+          <td><div style="font-size:11px;margin-bottom:4px;">${formatNum(a.neurons_today)} / ${formatNum(a.neurons_free_daily)}</div>${neuronBar(a.neurons_today, a.neurons_free_daily)}</td>
+          <td style="font-size:12px;">${formatNum(a.neurons_remaining)}</td>
+          <td>${a.requests_today}</td>
+          <td style="font-size:12px;${a.cooldown_seconds>0?'color:#fcd34d;':'color:#334155;'}">${a.cooldown_seconds>0 ? a.cooldown_seconds+'s' : '—'}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderStats() {
+      document.getElementById('stat-total').textContent = stats.total ?? '—';
+      document.getElementById('stat-available').textContent = stats.available ?? '—';
+      document.getElementById('stat-cooldown').textContent = stats.cooldown ?? '—';
+      document.getElementById('stat-neurons-used').textContent = formatNum(stats.neurons_used_today ?? 0);
+      document.getElementById('stat-neurons-remaining').textContent = formatNum(stats.neurons_remaining_today ?? 0);
+      document.getElementById('stat-requests').textContent = stats.requests_today ?? '—';
+      const cap = stats.neurons_capacity_today || 1;
+      const used = stats.neurons_used_today || 0;
+      const pct = Math.min(100, (used/cap)*100).toFixed(1);
+      document.getElementById('neuron-pct').textContent = `${formatNum(used)} / ${formatNum(cap)} (${pct}%)`;
+      document.getElementById('neuron-bar').style.width = pct + '%';
+    }
+
+    function renderLogs() {
+      const c = document.getElementById('logs-container');
+      if (!logs.length) { c.innerHTML = '<div style="color:#334155;font-size:13px;text-align:center;padding:32px 0;">No requests yet</div>'; return; }
+      c.innerHTML = logs.slice(0,100).map(l => {
+        const d = new Date(l.ts);
+        const ts = d.toLocaleString('en-US', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false });
+        const sc = l.status===200?'#6ee7b7':l.status===429?'#fcd34d':'#fca5a5';
+        return `<div class="log-entry">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+            <span style="color:#334155;">#${l.seq}</span>
+            <span style="color:#94a3b8;font-family:monospace;font-size:11px;">${ts}</span>
+            <span style="color:${sc};font-weight:600;">${l.status}</span>
+            <span style="color:#60a5fa;">${l.endpoint}</span>
+            <span style="color:#a78bfa;">${l.model || '—'}</span>
+            <span style="color:#475569;">${l.account_name || '—'}</span>
+            <span style="color:#334155;">${l.latency_ms}ms</span>
+          </div>
+          ${l.error?`<div style="color:#f87171;font-size:11px;margin-top:4px;">${l.error}</div>`:''}
+        </div>`;
+      }).join('');
+    }
+
+    function switchTab(tab) {
+      document.querySelectorAll('.tab-btn').forEach(t => t.classList.remove('active'));
+      document.getElementById('tab-accounts').classList.add('hidden');
+      document.getElementById('tab-logs').classList.add('hidden');
+      if (tab === 'accounts') {
+        document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
+        document.getElementById('tab-accounts').classList.remove('hidden');
+      } else {
+        document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
+        document.getElementById('tab-logs').classList.remove('hidden');
+      }
+    }
+
+    // ─── Data ───
+    async function fetchData() {
+      try {
+        const [accRes, logRes] = await Promise.all([authedFetch('/api/accounts'), authedFetch('/api/logs')]);
+        if (accRes.status === 401 || logRes.status === 401) {
+          document.getElementById('conn-status').textContent = '● unauthorized';
+          document.getElementById('conn-status').style.color = '#ef4444';
+          return;
+        }
+        const accData = await accRes.json();
+        const logData = await logRes.json();
+        accounts = accData.accounts || [];
+        stats = accData.stats || {};
+        logs = logData.logs || [];
+        renderStats(); renderAccounts(); renderLogs();
+        document.getElementById('conn-status').innerHTML = '<span class="live-pulse" style="color:#22c55e;">●</span> live';
+      } catch (e) {
+        document.getElementById('conn-status').textContent = '● disconnected';
+        document.getElementById('conn-status').style.color = '#ef4444';
+      }
+    }
+
+    async function importAccounts() {
+      try {
+        const res = await authedFetch('/api/import', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) { alert('Error: ' + data.error); return; }
+        alert(`Imported: ${data.imported}, Skipped: ${data.skipped}, Total: ${data.total}`);
+        fetchData();
+      } catch (e) { alert('Import failed: ' + e.message); }
+    }
+
+    async function clearLogs() {
+      await authedFetch('/api/logs', { method: 'DELETE' });
+      fetchData();
+    }
+
+    setInterval(fetchData, 10000);
+  </script>
+</body>
+</html>

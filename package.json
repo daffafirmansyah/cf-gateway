@@ -1,0 +1,16 @@
+{
+  "name": "cf-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lean CF Workers AI proxy with account pool rotation + neuron tracking",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.0"
+  }
+}
