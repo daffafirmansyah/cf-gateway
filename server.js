@@ -20,7 +20,10 @@ const NINE_DB = process.env.CF_GATEWAY_9ROUTER_DB || join(process.env.HOME || ''
 const OWN_DB = process.env.CF_GATEWAY_DB || join(__dirname, 'data', 'accounts.db');
 const API_KEY = process.env.CF_GATEWAY_API_KEY || '';
 const COOLDOWN_429 = parseInt(process.env.CF_GATEWAY_COOLDOWN_429 || '90', 10);
-const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '5', 10);
+const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '8', 10);
+const RETRY_DELAY_MS = parseInt(process.env.CF_GATEWAY_RETRY_DELAY_MS || '3000', 10);
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // --- Logger ---
 const stamp = () => new Date().toISOString().slice(11, 19);
@@ -106,9 +109,28 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
     });
   };
 
+  let capacityBackoffMs = 0; // exponential backoff tracker for capacity errors
+
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    // === GLOBAL CAPACITY GATE CHECK ===
+    // If CF backend is overloaded, wait for gate to clear before trying ANY account
+    const gate = pool.checkCapacityGate();
+    if (gate.blocked) {
+      log.info(`Capacity gate active — waiting ${Math.ceil(gate.waitMs / 1000)}s before retry (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(gate.waitMs);
+    }
+
     const account = pool.getAvailable();
     if (!account) {
+      // No accounts available — check if it's temporary (all in cooldown) or permanent
+      const gateInfo = pool.getCapacityGateInfo();
+      if (gateInfo.gate_active) {
+        // All accounts burned by capacity errors — wait and retry (don't count as attempt)
+        log.warn(`No available accounts during capacity gate — waiting ${Math.ceil(gateInfo.gate_remaining_ms / 1000)}s`);
+        await sleep(gateInfo.gate_remaining_ms);
+        attempt--; // don't count this as a real attempt
+        continue;
+      }
       record(null, 503, { error: 'No available accounts', provider_request: null });
       return res.status(503).json({ error: 'No available accounts', pool: pool.stats() });
     }
@@ -121,8 +143,6 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
 
     try {
       if (stream) {
-        // Record immediately so in-flight streams show in logs
-        record(account, 'streaming');
         let prepared = false;
         const result = await callStream(url, account.api_key, body, (chunk) => {
           if (!prepared) {
@@ -139,7 +159,15 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
           const errInfo = result.text ? result.text.slice(0, 200) : '';
           log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode} body=${errInfo}`);
           record(account, 429, { error_code: result.errorCode, error: errInfo });
-          pool.mark429(account.id, result.errorCode);
+          pool.mark429(account.id, result.errorCode, result.text);
+          // Exponential backoff for capacity errors, flat delay for rate limits
+          const isCapacity = result.errorCode === 4006 || result.errorCode === 3040;
+          if (isCapacity) {
+            capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 30000) : RETRY_DELAY_MS;
+            if (attempt < MAX_RETRIES - 1) await sleep(capacityBackoffMs);
+          } else {
+            if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
+          }
           continue;
         }
         if (result.status === 403) {
@@ -154,6 +182,7 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
           log.warn(`Account ${account.name} stream -> ${result.status}: ${result.text?.slice(0, 200)}`);
           record(account, result.status, { error: result.text?.slice(0, 200) });
           pool.markError(account.id);
+          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
           continue;
         }
         if (result.status >= 400) {
@@ -174,7 +203,15 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
         const errInfo = result.text ? result.text.slice(0, 200) : '';
         log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode} body=${errInfo}`);
         record(account, 429, { error_code: result.errorCode, error: errInfo });
-        pool.mark429(account.id, result.errorCode);
+        pool.mark429(account.id, result.errorCode, result.text);
+        // Exponential backoff for capacity errors, flat delay for rate limits
+        const isCapacity = result.errorCode === 4006 || result.errorCode === 3040;
+        if (isCapacity) {
+          capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 30000) : RETRY_DELAY_MS;
+          if (attempt < MAX_RETRIES - 1) await sleep(capacityBackoffMs);
+        } else {
+          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
+        }
         continue;
       }
       if (result.status === 403) {
@@ -187,6 +224,7 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
         log.warn(`Account ${account.name} -> ${result.status}: ${result.text?.slice(0, 200)}`);
         record(account, result.status, { error: result.text?.slice(0, 200) });
         pool.markError(account.id);
+        if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
         continue;
       }
       if (result.status >= 400) {
