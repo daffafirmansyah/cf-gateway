@@ -21,7 +21,7 @@ const NINE_DB = process.env.CF_GATEWAY_9ROUTER_DB || join(process.env.HOME || ''
 const OWN_DB = process.env.CF_GATEWAY_DB || join(__dirname, 'data', 'accounts.db');
 const API_KEY = process.env.CF_GATEWAY_API_KEY || '';
 const COOLDOWN_429 = parseInt(process.env.CF_GATEWAY_COOLDOWN_429 || '90', 10);
-const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '8', 10);
+const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '50', 10);
 const RETRY_DELAY_MS = parseInt(process.env.CF_GATEWAY_RETRY_DELAY_MS || '3000', 10);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -251,7 +251,33 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
 
     try {
       if (stream) {
-        // Commit 200 SSE up-front + heartbeat ping for slow TTFB models (glm-5.2: 40-80s)
+        // Try opening stream BEFORE sending headers — allows retry on 429
+        const opened = await openStream(url, account.api_key, body);
+        if (opened.status === 429) {
+          const errInfo = opened.text ? opened.text.slice(0, 200) : '';
+          log.warn(`Account ${account.name} stream 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${opened.errorCode}`);
+          record(account, 429, { error_code: opened.errorCode, error: errInfo });
+          pool.mark429(account.id, opened.errorCode, opened.text);
+          release();
+          // Exponential backoff for capacity errors
+          const isCapacity = opened.errorCode === 4006 || opened.errorCode === 3040;
+          if (isCapacity) {
+            capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 120000) : RETRY_DELAY_MS;
+            if (attempt < MAX_RETRIES - 1) await sleep(capacityBackoffMs);
+          } else {
+            if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
+          }
+          continue; // retry with next account
+        }
+        if (opened.status >= 400) {
+          log.warn(`Account ${account.name} stream -> ${opened.status}: ${opened.text?.slice(0, 200)}`);
+          record(account, opened.status, { error: opened.text?.slice(0, 200) });
+          release();
+          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
+          continue; // retry
+        }
+
+        // Stream opened successfully — NOW send headers
         res.status(200);
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -263,27 +289,6 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
         const heartbeat = setInterval(() => {
           if (!realDataStarted && !res.writableEnded) res.write(': ping\n');
         }, 15000);
-
-        const opened = await openStream(url, account.api_key, body);
-        if (opened.status === 429) {
-          clearInterval(heartbeat);
-          const errInfo = opened.text ? opened.text.slice(0, 200) : '';
-          log.warn(`Account ${account.name} stream 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${opened.errorCode}`);
-          record(account, 429, { error_code: opened.errorCode, error: errInfo });
-          pool.mark429(account.id, opened.errorCode, opened.text);
-          // Headers already sent — surface error as SSE event
-          res.write(`data: {"error":"rate_limited","code":${opened.errorCode ?? 429}}\n\n`);
-          res.write('data: [DONE]\n\n');
-          return res.end();
-        }
-        if (opened.status >= 400) {
-          clearInterval(heartbeat);
-          log.warn(`Account ${account.name} stream -> ${opened.status}: ${opened.text?.slice(0, 200)}`);
-          record(account, opened.status, { error: opened.text?.slice(0, 200) });
-          res.write(`data: {"error":"upstream_error","status":${opened.status}}\n\n`);
-          res.write('data: [DONE]\n\n');
-          return res.end();
-        }
 
         const writeChunk = (chunk) => {
           if (chunk && chunk.length) realDataStarted = true;
@@ -308,7 +313,7 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
         // Exponential backoff for capacity errors, flat delay for rate limits
         const isCapacity = result.errorCode === 4006 || result.errorCode === 3040;
         if (isCapacity) {
-          capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 30000) : RETRY_DELAY_MS;
+          capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 120000) : RETRY_DELAY_MS;
           if (attempt < MAX_RETRIES - 1) await sleep(capacityBackoffMs);
         } else {
           if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
