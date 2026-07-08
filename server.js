@@ -121,6 +121,8 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
 
     try {
       if (stream) {
+        // Record immediately so in-flight streams show in logs
+        record(account, 'streaming');
         let prepared = false;
         const result = await callStream(url, account.api_key, body, (chunk) => {
           if (!prepared) {
