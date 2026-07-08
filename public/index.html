@@ -351,6 +351,7 @@
     <div class="flex gap-1 mb-0 relative z-10">
       <div class="tab-btn active" onclick="switchTab('accounts')">Accounts</div>
       <div class="tab-btn" onclick="switchTab('logs')">Request Logs</div>
+      <div class="tab-btn" onclick="switchTab('models')">Models</div>
     </div>
 
     <!-- Accounts Panel -->
@@ -390,12 +391,42 @@
       <div id="logs-container" style="max-height:60vh; overflow-y:auto;"></div>
     </div>
 
+    <!-- Models Panel -->
+    <div id="tab-models" class="glass rounded-t-none p-5 hidden" style="border-top-left-radius:0;">
+      <div class="flex justify-between items-center mb-4">
+        <div class="flex gap-3 items-center">
+          <input id="model-search" type="text" placeholder="Search model..." oninput="renderModels()" class="search-input">
+          <select id="filter-task" onchange="renderModels()" class="filter-select">
+            <option value="">All Tasks</option>
+            <option value="Text Generation">Text Generation</option>
+            <option value="Image Classification">Vision</option>
+            <option value="Text Embeddings">Embeddings</option>
+          </select>
+        </div>
+        <div class="flex gap-2 items-center">
+          <span style="font-size:12px; color:#475569;" id="model-count">—</span>
+          <button onclick="refreshModels()" class="btn-ghost" style="font-size:12px; padding:6px 12px;">↻ Refresh</button>
+        </div>
+      </div>
+      <div style="max-height:60vh; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>Model ID</th><th>Task</th><th>Capabilities</th><th>Description</th>
+            </tr>
+          </thead>
+          <tbody id="models-body"></tbody>
+        </table>
+      </div>
+    </div>
+
   </div>
 
   <script>
     let accounts = [];
     let stats = {};
     let logs = [];
+    let models = [];
 
     // ─── Auth ───
     function getApiKey() { return localStorage.getItem('cf_api_key') || ''; }
@@ -544,17 +575,60 @@
       }).join('');
     }
 
+    // ─── Models ───
+    function renderModels() {
+      const search = document.getElementById('model-search').value.toLowerCase();
+      const taskFilter = document.getElementById('filter-task').value;
+      let f = models;
+      if (search) f = f.filter(m => m.name.toLowerCase().includes(search) || m.task?.toLowerCase().includes(search) || m.description?.toLowerCase().includes(search));
+      if (taskFilter) f = f.filter(m => m.task === taskFilter);
+      document.getElementById('model-count').textContent = `${f.length} / ${models.length} models`;
+      const taskBadge = (t) => {
+        const m = { 'Text Generation':'badge-green', 'Image Classification':'badge-yellow', 'Text Embeddings':'badge-gray', 'Speech-to-Text':'badge-yellow', 'Image-to-Text':'badge-yellow' };
+        return t ? `<span class="badge ${m[t]||'badge-gray'}">${t}</span>` : '<span style="color:#334155;">—</span>';
+      };
+      const caps = (m) => {
+        const c = m.capabilities || [];
+        return c.length ? c.map(x => `<span class="badge badge-gray" style="font-size:10px;">${x}</span>`).join(' ') : '<span style="color:#334155;">—</span>';
+      };
+      document.getElementById('models-body').innerHTML = f.map((m, i) => `
+        <tr>
+          <td style="color:#475569;">${i+1}</td>
+          <td style="font-family:monospace; font-size:12px; color:#60a5fa;">${m.name}</td>
+          <td>${taskBadge(m.task)}</td>
+          <td>${caps(m)}</td>
+          <td style="font-size:12px; color:#64748b; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${m.description || '—'}</td>
+        </tr>
+      `).join('');
+    }
+
+    async function fetchModels() {
+      try {
+        const res = await authedFetch('/api/models');
+        if (!res.ok) return;
+        const data = await res.json();
+        models = data.models || [];
+        renderModels();
+      } catch (e) { /* silent */ }
+    }
+
+    async function refreshModels() {
+      try {
+        const res = await authedFetch('/api/models?fresh=1');
+        if (!res.ok) return;
+        const data = await res.json();
+        models = data.models || [];
+        renderModels();
+      } catch (e) { /* silent */ }
+    }
+
     function switchTab(tab) {
-      document.querySelectorAll('.tab-btn').forEach(t => t.classList.remove('active'));
-      document.getElementById('tab-accounts').classList.add('hidden');
-      document.getElementById('tab-logs').classList.add('hidden');
-      if (tab === 'accounts') {
-        document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
-        document.getElementById('tab-accounts').classList.remove('hidden');
-      } else {
-        document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
-        document.getElementById('tab-logs').classList.remove('hidden');
-      }
+      const tabs = ['accounts', 'logs', 'models'];
+      document.querySelectorAll('.tab-btn').forEach((t, i) => {
+        t.classList.toggle('active', tabs[i] === tab);
+        document.getElementById('tab-' + tabs[i]).classList.toggle('hidden', tabs[i] !== tab);
+      });
+      if (tab === 'models' && !models.length) fetchModels();
     }
 
     // ─── Data ───
