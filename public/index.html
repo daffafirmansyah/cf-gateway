@@ -285,6 +285,23 @@
       </div>
     </div>
 
+    <!-- Health Status Banner -->
+    <div id="health-banner" class="glass-sm p-4 mb-6 fade-up" style="display:none;">
+      <div class="flex items-center justify-between flex-wrap gap-3">
+        <div class="flex items-center gap-3">
+          <span id="health-dot" class="dot dot-green"></span>
+          <span id="health-status" style="font-size:14px; font-weight:600; color:#e2e8f0;">—</span>
+          <span id="health-uptime" style="font-size:12px; color:#475569; font-family:monospace;"></span>
+        </div>
+        <div class="flex items-center gap-5" style="font-size:12px; color:#64748b;">
+          <span>Queue: <span id="health-queue" style="color:#94a3b8; font-family:monospace;">—</span></span>
+          <span>Gate: <span id="health-gate" style="font-family:monospace;">—</span></span>
+          <span>Concurrency: <span id="health-conc" style="color:#94a3b8; font-family:monospace;">—</span></span>
+          <span>Last success: <span id="health-last" style="color:#94a3b8; font-family:monospace;">—</span></span>
+        </div>
+      </div>
+    </div>
+
     <!-- Stats Grid -->
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
       <div class="stat-card fade-up">
@@ -578,6 +595,54 @@
     }
 
     setInterval(fetchData, 3000);
+    setInterval(fetchHealth, 3000);
+    fetchHealth();
+
+    // ─── Health ───
+    async function fetchHealth() {
+      try {
+        const res = await fetch('/health');
+        if (!res.ok) return;
+        const h = await res.json();
+        const banner = document.getElementById('health-banner');
+        banner.style.display = 'block';
+
+        // Status
+        const statusMap = { ok: { dot: 'dot-green', color: '#6ee7b7', label: '● Healthy' }, degraded: { dot: 'dot-yellow', color: '#fcd34d', label: '● Degraded' }, down: { dot: 'dot-red', color: '#fca5a5', label: '● Down' } };
+        const s = statusMap[h.status] || statusMap.ok;
+        document.getElementById('health-dot').className = 'dot ' + s.dot;
+        document.getElementById('health-status').textContent = s.label;
+        document.getElementById('health-status').style.color = s.color;
+
+        // Uptime
+        const up = h.uptime || 0;
+        const hrs = Math.floor(up / 3600), mins = Math.floor((up % 3600) / 60), secs = up % 60;
+        document.getElementById('health-uptime').textContent = hrs > 0 ? `${hrs}h ${mins}m` : mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+        // Queue
+        const q = h.queue || {};
+        document.getElementById('health-queue').textContent = q.size > 0 ? `${q.size}/${q.max}` : 'empty';
+        document.getElementById('health-queue').style.color = q.size > 0 ? '#fcd34d' : '#6ee7b7';
+
+        // Gate
+        const g = h.capacity_gate || {};
+        document.getElementById('health-gate').textContent = g.active ? `ACTIVE (${Math.ceil((g.remaining_ms||0)/1000)}s)` : 'off';
+        document.getElementById('health-gate').style.color = g.active ? '#fca5a5' : '#6ee7b7';
+
+        // Concurrency
+        const c = h.concurrency || {};
+        document.getElementById('health-conc').textContent = `${c.in_flight||0}/${c.max||0}`;
+
+        // Last success
+        const ls = h.last_success;
+        if (ls) {
+          const d = new Date(ls);
+          document.getElementById('health-last').textContent = d.toLocaleTimeString('en-US', { hour12: false });
+        } else {
+          document.getElementById('health-last').textContent = 'never';
+        }
+      } catch (e) { /* silent */ }
+    }
   </script>
 </body>
 </html>
