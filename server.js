@@ -20,7 +20,7 @@ const NINE_DB = process.env.CF_GATEWAY_9ROUTER_DB || join(process.env.HOME || ''
 const OWN_DB = process.env.CF_GATEWAY_DB || join(__dirname, 'data', 'accounts.db');
 const API_KEY = process.env.CF_GATEWAY_API_KEY || '';
 const COOLDOWN_429 = parseInt(process.env.CF_GATEWAY_COOLDOWN_429 || '90', 10);
-const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '50', 10);
+const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '5', 10);
 
 // --- Logger ---
 const stamp = () => new Date().toISOString().slice(11, 19);
@@ -140,7 +140,22 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
           pool.mark429(account.id, result.errorCode);
           continue;
         }
+        if (result.status === 403) {
+          // Bad API key or suspended — deactivate and try next account
+          log.warn(`Account ${account.name} 403 — deactivating`);
+          record(account, 403, { error: result.text?.slice(0, 200) });
+          pool.deactivate(account.id);
+          continue;
+        }
+        if (result.status >= 500) {
+          // CF server error — cooldown and retry
+          log.warn(`Account ${account.name} stream -> ${result.status}: ${result.text?.slice(0, 200)}`);
+          record(account, result.status, { error: result.text?.slice(0, 200) });
+          pool.markError(account.id);
+          continue;
+        }
         if (result.status >= 400) {
+          // Client error (400/401/404/etc) — return immediately, retrying won't help
           log.warn(`Account ${account.name} stream -> ${result.status}: ${result.text?.slice(0, 200)}`);
           record(account, result.status, { error: result.text?.slice(0, 200) });
           return res.status(result.status).type('application/json').send(result.text);
@@ -158,6 +173,18 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
         log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode} body=${errInfo}`);
         record(account, 429, { error_code: result.errorCode, error: errInfo });
         pool.mark429(account.id, result.errorCode);
+        continue;
+      }
+      if (result.status === 403) {
+        log.warn(`Account ${account.name} 403 — deactivating`);
+        record(account, 403, { error: result.text?.slice(0, 200) });
+        pool.deactivate(account.id);
+        continue;
+      }
+      if (result.status >= 500) {
+        log.warn(`Account ${account.name} -> ${result.status}: ${result.text?.slice(0, 200)}`);
+        record(account, result.status, { error: result.text?.slice(0, 200) });
+        pool.markError(account.id);
         continue;
       }
       if (result.status >= 400) {
