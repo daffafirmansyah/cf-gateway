@@ -295,7 +295,7 @@
         </div>
         <div class="flex items-center gap-5" style="font-size:12px; color:#64748b;">
           <span>Concurrency: <span id="health-conc" style="color:#94a3b8; font-family:monospace;">—</span></span>
-          <span>Capacity Gate: <span id="health-gate" style="font-family:monospace;">—</span></span>
+          <span>Capacity Errors: <span id="health-capacity" style="font-family:monospace;">—</span></span>
           <span>Model Locks: <span id="health-locks" style="color:#94a3b8; font-family:monospace;">—</span></span>
           <span>Probing: <span id="health-probe" style="color:#94a3b8; font-family:monospace;">—</span></span>
           <span>Last success: <span id="health-last" style="color:#94a3b8; font-family:monospace;">—</span></span>
@@ -734,10 +734,10 @@
         const c = h.concurrency || {};
         document.getElementById('health-conc').textContent = `${c.in_flight||0}/${c.max||0}`;
 
-        // Capacity Gate
-        const gate = h.capacity_gate || {};
-        document.getElementById('health-gate').textContent = gate.active ? `ACTIVE (${gate.hits} hits)` : 'off';
-        document.getElementById('health-gate').style.color = gate.active ? '#fca5a5' : '#6ee7b7';
+        // Capacity Errors
+        const capFailures = h.capacity_failures || 0;
+        document.getElementById('health-capacity').textContent = capFailures > 0 ? `${capFailures} errors` : 'none';
+        document.getElementById('health-capacity').style.color = capFailures > 0 ? '#fcd34d' : '#6ee7b7';
 
         // Model Locks
         const locks = h.model_locks || {};

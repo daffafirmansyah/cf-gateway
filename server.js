@@ -171,18 +171,6 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
   const reqStartedAt = Date.now();
   const clientReq = clientRequest ?? captureBody(body);
 
-  // Check capacity gate early
-  if (pool.isCapacityGated()) {
-    const stats = pool.stats();
-    log.warn(`Request rejected: capacity gate active (${stats.capacity_gate.hits} hits in 60s)`);
-    record(null, 503, { error: 'CF capacity gate active', gate: stats.capacity_gate });
-    return res.status(503).json({ 
-      error: 'Cloudflare capacity gate active', 
-      retry_after: Math.ceil((pool._capacityGateUntil - Date.now() / 1000)),
-      pool: stats 
-    });
-  }
-
   const record = (account, status, extra = {}) => {
     requestLog.record({
       endpoint,
@@ -208,16 +196,9 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
       return res.status(504).json({ error: 'Request deadline exceeded', attempts: attempt });
     }
 
-    // Check capacity gate mid-retry
-    if (pool.isCapacityGated()) {
-      log.warn(`Capacity gate activated during retry (attempt ${attempt})`);
-      record(null, 503, { error: 'Capacity gate activated during retry' });
-      return res.status(503).json({ error: 'CF capacity gate activated', pool: pool.stats() });
-    }
-
-    // Early exit: 3 consecutive capacity errors = stop retrying
-    if (consecutiveCapacityErrors >= 3) {
-      log.warn(`Early exit: ${consecutiveCapacityErrors} consecutive capacity errors`);
+    // Soft stop: 5 consecutive capacity errors = stop retrying this request
+    if (consecutiveCapacityErrors >= 5) {
+      log.warn(`Soft stop: ${consecutiveCapacityErrors} consecutive capacity errors`);
       record(null, 503, { error: 'Consecutive capacity errors', count: consecutiveCapacityErrors });
       return res.status(503).json({ error: 'CF capacity exhausted', pool: pool.stats() });
     }
@@ -348,7 +329,6 @@ app.get('/health', (_req, res) => {
   let status = 'ok';
   if (stats.available === 0) status = 'down';
   else if (stats.cooldown > stats.total * 0.5) status = 'degraded';
-  else if (stats.capacity_gate.active) status = 'degraded';
   const code = status === 'down' ? 503 : 200;
   res.status(code).json({
     status,
@@ -372,14 +352,13 @@ app.get('/health', (_req, res) => {
       queued: _waitQueue.length,
     },
     last_success: lastSuccessAt,
-    capacity_gate: stats.capacity_gate,
+    capacity_failures: stats.capacity_failures,
     model_locks: stats.model_locks,
     probing: stats.probing,
     features: {
       model_lock_sync: SYNC_LOCKS,
       per_model_locks: true,
       backoff_decay: true,
-      capacity_gate: true,
       probing: true,
       decay_interval_ms: DECAY_INTERVAL_MS,
       decay_threshold_sec: DECAY_THRESHOLD_SEC,
