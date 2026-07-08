@@ -300,6 +300,12 @@ app.get('/health', (_req, res) => {
       queued: _waitQueue.length,
     },
     last_success: lastSuccessAt,
+    features: {
+      model_lock_sync: SYNC_LOCKS,
+      backoff_decay: true,
+      decay_interval_ms: DECAY_INTERVAL_MS,
+      decay_threshold_sec: DECAY_THRESHOLD_SEC,
+    },
   });
 });
 
