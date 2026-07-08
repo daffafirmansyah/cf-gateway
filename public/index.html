@@ -295,8 +295,9 @@
         </div>
         <div class="flex items-center gap-5" style="font-size:12px; color:#64748b;">
           <span>Concurrency: <span id="health-conc" style="color:#94a3b8; font-family:monospace;">—</span></span>
-          <span>modelLock Sync: <span id="health-sync" style="font-family:monospace;">—</span></span>
-          <span>Backoff Decay: <span id="health-decay" style="font-family:monospace;">—</span></span>
+          <span>Capacity Gate: <span id="health-gate" style="font-family:monospace;">—</span></span>
+          <span>Model Locks: <span id="health-locks" style="color:#94a3b8; font-family:monospace;">—</span></span>
+          <span>Probing: <span id="health-probe" style="color:#94a3b8; font-family:monospace;">—</span></span>
           <span>Last success: <span id="health-last" style="color:#94a3b8; font-family:monospace;">—</span></span>
         </div>
       </div>
@@ -363,6 +364,7 @@
             <option value="">All Status</option>
             <option value="available">Available</option>
             <option value="cooldown">Cooldown</option>
+            <option value="locked">Locked</option>
             <option value="exhausted">Exhausted</option>
             <option value="inactive">Inactive</option>
           </select>
@@ -380,6 +382,7 @@
           <tbody id="accounts-body"></tbody>
         </table>
       </div>
+      <div id="pagination"></div>
     </div>
 
     <!-- Logs Panel -->
@@ -504,11 +507,11 @@
     }
 
     function statusBadge(s) {
-      const m = { available:'badge-green', cooldown:'badge-yellow', exhausted:'badge-red', inactive:'badge-gray' };
+      const m = { available:'badge-green', cooldown:'badge-yellow', exhausted:'badge-red', inactive:'badge-gray', locked:'badge-yellow' };
       return `<span class="badge ${m[s]||'badge-gray'}">${s}</span>`;
     }
     function statusDot(s) {
-      const m = { available:'dot-green', cooldown:'dot-yellow', exhausted:'dot-red', inactive:'dot-gray' };
+      const m = { available:'dot-green', cooldown:'dot-yellow', exhausted:'dot-red', inactive:'dot-gray', locked:'dot-yellow' };
       return `<span class="dot ${m[s]||'dot-gray'}"></span>`;
     }
     function neuronBar(used, total) {
@@ -632,25 +635,59 @@
     }
 
     // ─── Data ───
+    let currentPage = 1;
+    let totalPages = 1;
+    let totalAccounts = 0;
+    const PER_PAGE = 50;
+
     async function fetchData() {
       try {
-        const [accRes, logRes] = await Promise.all([authedFetch('/api/accounts'), authedFetch('/api/logs')]);
-        if (accRes.status === 401 || logRes.status === 401) {
+        const [accRes, logRes, statsRes] = await Promise.all([
+          authedFetch(`/api/accounts?page=${currentPage}&per_page=${PER_PAGE}`),
+          authedFetch('/api/logs'),
+          authedFetch('/api/stats')
+        ]);
+        if (accRes.status === 401 || logRes.status === 401 || statsRes.status === 401) {
           document.getElementById('conn-status').textContent = '● unauthorized';
           document.getElementById('conn-status').style.color = '#ef4444';
           return;
         }
         const accData = await accRes.json();
         const logData = await logRes.json();
+        const statsData = await statsRes.json();
         accounts = accData.accounts || [];
-        stats = accData.stats || {};
+        totalPages = accData.total_pages || 1;
+        totalAccounts = accData.total || 0;
+        stats = statsData;
         logs = logData.logs || [];
-        renderStats(); renderAccounts(); renderLogs();
+        renderStats(); renderAccounts(); renderLogs(); renderPagination();
         document.getElementById('conn-status').innerHTML = '<span class="live-pulse" style="color:#22c55e;">●</span> live';
       } catch (e) {
         document.getElementById('conn-status').textContent = '● disconnected';
         document.getElementById('conn-status').style.color = '#ef4444';
       }
+    }
+
+    function renderPagination() {
+      const container = document.getElementById('pagination');
+      if (!container) return;
+      if (totalPages <= 1) { container.innerHTML = ''; return; }
+      container.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;justify-content:center;padding:12px 0;">
+          <button onclick="goPage(1)" class="btn-ghost" style="padding:6px 10px;font-size:12px;" ${currentPage===1?'disabled':''}>«</button>
+          <button onclick="goPage(${currentPage-1})" class="btn-ghost" style="padding:6px 10px;font-size:12px;" ${currentPage===1?'disabled':''}>‹</button>
+          <span style="font-size:12px;color:#94a3b8;font-family:monospace;">Page ${currentPage} / ${totalPages}</span>
+          <button onclick="goPage(${currentPage+1})" class="btn-ghost" style="padding:6px 10px;font-size:12px;" ${currentPage===totalPages?'disabled':''}>›</button>
+          <button onclick="goPage(${totalPages})" class="btn-ghost" style="padding:6px 10px;font-size:12px;" ${currentPage===totalPages?'disabled':''}>»</button>
+          <span style="font-size:11px;color:#475569;margin-left:8px;">${totalAccounts} accounts</span>
+        </div>
+      `;
+    }
+
+    function goPage(p) {
+      if (p < 1 || p > totalPages) return;
+      currentPage = p;
+      fetchData();
     }
 
     async function importAccounts() {
@@ -697,12 +734,21 @@
         const c = h.concurrency || {};
         document.getElementById('health-conc').textContent = `${c.in_flight||0}/${c.max||0}`;
 
-        // Features
-        const f = h.features || {};
-        document.getElementById('health-sync').textContent = f.model_lock_sync ? 'ON' : 'OFF';
-        document.getElementById('health-sync').style.color = f.model_lock_sync ? '#fcd34d' : '#6ee7b7';
-        document.getElementById('health-decay').textContent = f.backoff_decay ? `${f.decay_threshold_sec||600}s` : 'OFF';
-        document.getElementById('health-decay').style.color = f.backoff_decay ? '#6ee7b7' : '#64748b';
+        // Capacity Gate
+        const gate = h.capacity_gate || {};
+        document.getElementById('health-gate').textContent = gate.active ? `ACTIVE (${gate.hits} hits)` : 'off';
+        document.getElementById('health-gate').style.color = gate.active ? '#fca5a5' : '#6ee7b7';
+
+        // Model Locks
+        const locks = h.model_locks || {};
+        const lockCount = Object.values(locks).reduce((a, b) => a + b, 0);
+        document.getElementById('health-locks').textContent = lockCount > 0 ? `${lockCount} locked` : 'none';
+        document.getElementById('health-locks').style.color = lockCount > 0 ? '#fcd34d' : '#6ee7b7';
+
+        // Probing
+        const probing = h.probing || 0;
+        document.getElementById('health-probe').textContent = probing > 0 ? `${probing} testing` : 'idle';
+        document.getElementById('health-probe').style.color = probing > 0 ? '#60a5fa' : '#6ee7b7';
 
         // Last success
         const ls = h.last_success;

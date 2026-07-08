@@ -78,9 +78,39 @@ const DECAY_INTERVAL_MS = parseInt(process.env.CF_GATEWAY_DECAY_INTERVAL_MS || '
 const DECAY_THRESHOLD_SEC = parseInt(process.env.CF_GATEWAY_DECAY_THRESHOLD_SEC || '600', 10);
 function doDecay() {
   pool.decayBackoff(DECAY_THRESHOLD_SEC);
+  pool.decayLocks(DECAY_THRESHOLD_SEC);
 }
 doDecay(); // initial decay
 setInterval(doDecay, DECAY_INTERVAL_MS);
+
+// --- Probing --- test locked accounts every 10 minutes
+const PROBE_INTERVAL_MS = parseInt(process.env.CF_GATEWAY_PROBE_INTERVAL_MS || '600000', 10);
+async function doProbe() {
+  const model = '@cf/zai-org/glm-5.2'; // Default model for probing
+  const account = pool.getProbeAccount(model);
+  if (!account) return;
+  
+  try {
+    const url = chatUrl(account.account_id);
+    const result = await callNormal(url, account.api_key, {
+      model: '@cf/zai-org/glm-5.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+    });
+    
+    if (result.status === 200) {
+      pool.markProbeResult(account.id, true);
+      log.info(`probe: account #${account.id} (${account.name}) recovered!`);
+    } else {
+      pool.markProbeResult(account.id, false);
+      log.debug(`probe: account #${account.id} still failing (${result.status})`);
+    }
+  } catch (e) {
+    pool.markProbeResult(account.id, false);
+    log.debug(`probe: account #${account.id} error: ${e.message}`);
+  }
+}
+setInterval(doProbe, PROBE_INTERVAL_MS);
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -127,7 +157,7 @@ function flattenContent(messages) {
   return messages;
 }
 
-// --- Core: retry across pool on 429 (no gate, no backoff — like 9router) ---
+// --- Core: retry across pool with per-model locks and capacity gate ---
 async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRequest }) {
   await acquireSlot();
   try {
@@ -140,6 +170,18 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
 async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, clientRequest }) {
   const reqStartedAt = Date.now();
   const clientReq = clientRequest ?? captureBody(body);
+
+  // Check capacity gate early
+  if (pool.isCapacityGated()) {
+    const stats = pool.stats();
+    log.warn(`Request rejected: capacity gate active (${stats.capacity_gate.hits} hits in 60s)`);
+    record(null, 503, { error: 'CF capacity gate active', gate: stats.capacity_gate });
+    return res.status(503).json({ 
+      error: 'Cloudflare capacity gate active', 
+      retry_after: Math.ceil((pool._capacityGateUntil - Date.now() / 1000)),
+      pool: stats 
+    });
+  }
 
   const record = (account, status, extra = {}) => {
     requestLog.record({
@@ -156,15 +198,31 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
     });
   };
 
+  let consecutiveCapacityErrors = 0;
+
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    // Deadline check — prevent infinite retry holding slot
+    // Deadline check
     if (Date.now() - reqStartedAt > REQUEST_DEADLINE_MS) {
       log.warn(`Deadline exceeded (${Math.ceil((Date.now() - reqStartedAt) / 1000)}s) after ${attempt} attempts`);
       record(null, 504, { error: 'Request deadline exceeded', attempts: attempt });
       return res.status(504).json({ error: 'Request deadline exceeded', attempts: attempt });
     }
 
-    const account = pool.getAvailable();
+    // Check capacity gate mid-retry
+    if (pool.isCapacityGated()) {
+      log.warn(`Capacity gate activated during retry (attempt ${attempt})`);
+      record(null, 503, { error: 'Capacity gate activated during retry' });
+      return res.status(503).json({ error: 'CF capacity gate activated', pool: pool.stats() });
+    }
+
+    // Early exit: 3 consecutive capacity errors = stop retrying
+    if (consecutiveCapacityErrors >= 3) {
+      log.warn(`Early exit: ${consecutiveCapacityErrors} consecutive capacity errors`);
+      record(null, 503, { error: 'Consecutive capacity errors', count: consecutiveCapacityErrors });
+      return res.status(503).json({ error: 'CF capacity exhausted', pool: pool.stats() });
+    }
+
+    const account = pool.getAvailable(model);
     if (!account) {
       record(null, 503, { error: 'No available accounts' });
       return res.status(503).json({ error: 'No available accounts', pool: pool.stats() });
@@ -180,11 +238,17 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
       if (stream) {
         const opened = await openStream(url, account.api_key, body);
         if (opened.status === 429) {
-          log.warn(`Account ${account.name} stream 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${opened.errorCode}`);
-          record(account, 429, { error_code: opened.errorCode });
-          pool.mark429(account.id, opened.errorCode, opened.text);
+          const classification = pool.mark429(account.id, opened.errorCode, opened.text, model);
+          log.warn(`Account ${account.name} stream 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${opened.errorCode} action=${classification.action}`);
+          record(account, 429, { error_code: opened.errorCode, action: classification.action });
           release();
-          continue; // immediately try next account
+          
+          if (classification.action === 'capacity') {
+            consecutiveCapacityErrors++;
+          } else {
+            consecutiveCapacityErrors = 0;
+          }
+          continue;
         }
         if (opened.status >= 400) {
           log.warn(`Account ${account.name} stream -> ${opened.status}`);
@@ -193,7 +257,7 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
           continue;
         }
 
-        // Stream opened — send headers
+        // Stream opened
         res.status(200);
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
@@ -222,13 +286,17 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
       // Non-streaming
       const result = await callNormal(url, account.api_key, body);
       if (result.status === 429) {
-        log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode}`);
-        record(account, 429, { error_code: result.errorCode });
-        pool.mark429(account.id, result.errorCode, result.text);
-        // No delay for capacity errors (4006/3040) — immediately try next
-        // Small delay only for per-minute rate limits
-        const isCapacity = result.errorCode === 4006 || result.errorCode === 3040;
-        if (!isCapacity && attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
+        const classification = pool.mark429(account.id, result.errorCode, result.text, model);
+        log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode} action=${classification.action}`);
+        record(account, 429, { error_code: result.errorCode, action: classification.action });
+        
+        if (classification.action === 'capacity') {
+          consecutiveCapacityErrors++;
+          // No delay for capacity errors, immediately try next
+        } else {
+          consecutiveCapacityErrors = 0;
+          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
+        }
         continue;
       }
       if (result.status === 403) {
@@ -248,10 +316,13 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
         record(account, result.status, { error: result.text?.slice(0, 200) });
         return res.status(result.status).type('application/json').send(result.text);
       }
+      
+      // Success!
       log.info(`Account ${account.name} -> 200 (attempt ${attempt + 1})`);
       record(account, 200, { usage: result.usage });
       pool.markSuccess(account.id, model, result.usage);
       lastSuccessAt = new Date().toISOString();
+      consecutiveCapacityErrors = 0;
       return res.json(result.json);
     } catch (e) {
       log.warn(`Account ${account.name} error: ${e.message}`);
@@ -277,6 +348,7 @@ app.get('/health', (_req, res) => {
   let status = 'ok';
   if (stats.available === 0) status = 'down';
   else if (stats.cooldown > stats.total * 0.5) status = 'degraded';
+  else if (stats.capacity_gate.active) status = 'degraded';
   const code = status === 'down' ? 503 : 200;
   res.status(code).json({
     status,
@@ -300,9 +372,15 @@ app.get('/health', (_req, res) => {
       queued: _waitQueue.length,
     },
     last_success: lastSuccessAt,
+    capacity_gate: stats.capacity_gate,
+    model_locks: stats.model_locks,
+    probing: stats.probing,
     features: {
       model_lock_sync: SYNC_LOCKS,
+      per_model_locks: true,
       backoff_decay: true,
+      capacity_gate: true,
+      probing: true,
       decay_interval_ms: DECAY_INTERVAL_MS,
       decay_threshold_sec: DECAY_THRESHOLD_SEC,
     },
@@ -389,7 +467,61 @@ app.get('/api/accounts', (req, res) => {
   const offset = (page - 1) * perPage;
   const rows = db.prepare('SELECT * FROM accounts ORDER BY id LIMIT ? OFFSET ?').all(perPage, offset);
   const total = db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c;
-  res.json({ accounts: rows, page, per_page: perPage, total, total_pages: Math.ceil(total / perPage) });
+  const today = todayUTC();
+  const now = Date.now() / 1000;
+
+  // Get all model locks for these accounts
+  const accountIds = rows.map(r => r.id);
+  const locksByAccount = {};
+  if (accountIds.length > 0) {
+    const placeholders = accountIds.map(() => '?').join(',');
+    const locks = db.prepare(
+      `SELECT account_id, model, locked_until, error_count FROM model_locks 
+       WHERE account_id IN (${placeholders}) AND locked_until > ?`
+    ).all(...accountIds, now);
+    for (const lock of locks) {
+      if (!locksByAccount[lock.account_id]) locksByAccount[lock.account_id] = [];
+      locksByAccount[lock.account_id].push({
+        model: lock.model,
+        locked_until: lock.locked_until,
+        cooldown_seconds: Math.ceil(lock.locked_until - now),
+        error_count: lock.error_count,
+      });
+    }
+  }
+
+  // Compute status and display fields
+  const accounts = rows.map(row => {
+    const sameDay = row.neurons_day === today;
+    const neuronsUsed = sameDay ? row.neurons_today : 0;
+    const neuronsRemaining = Math.max(0, NEURON_FREE_DAILY - neuronsUsed);
+    const cooldownSeconds = row.cooldown_until > now ? Math.ceil(row.cooldown_until - now) : 0;
+    const modelLocks = locksByAccount[row.id] || [];
+
+    let status;
+    if (!row.is_active) status = 'inactive';
+    else if (neuronsUsed >= NEURON_FREE_DAILY) status = 'exhausted';
+    else if (cooldownSeconds > 0) status = 'cooldown';
+    else if (modelLocks.length > 0) status = 'locked';
+    else status = 'available';
+
+    return {
+      id: row.id,
+      name: row.name,
+      account_id: row.account_id,
+      status,
+      neurons_today: neuronsUsed,
+      neurons_free_daily: NEURON_FREE_DAILY,
+      neurons_remaining: neuronsRemaining,
+      requests_today: sameDay ? row.requests_today : 0,
+      cooldown_seconds: cooldownSeconds,
+      backoff_level: row.backoff_level,
+      error_count: row.error_count,
+      model_locks: modelLocks,
+    };
+  });
+
+  res.json({ accounts, page, per_page: perPage, total, total_pages: Math.ceil(total / perPage) });
 });
 
 // Admin: /api/logs
