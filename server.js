@@ -25,6 +25,19 @@ const RETRY_DELAY_MS = parseInt(process.env.CF_GATEWAY_RETRY_DELAY_MS || '3000',
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// --- Concurrency limiter ---
+const MAX_CONCURRENT = parseInt(process.env.CF_GATEWAY_MAX_CONCURRENT || '2', 10);
+let _inFlight = 0;
+const _waitQueue = [];
+function acquireSlot() {
+  if (_inFlight < MAX_CONCURRENT) { _inFlight++; return Promise.resolve(); }
+  return new Promise(resolve => _waitQueue.push(resolve));
+}
+function releaseSlot() {
+  if (_waitQueue.length > 0) { _waitQueue.shift()(); }
+  else { _inFlight--; }
+}
+
 // --- Logger ---
 const stamp = () => new Date().toISOString().slice(11, 19);
 const log = {
@@ -91,6 +104,23 @@ function flattenContent(messages) {
 
 // --- Core: retry across pool on 429 ---
 async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRequest }) {
+  // === FAST GATE CHECK — reject immediately if CF is overloaded ===
+  const preGate = pool.checkCapacityGate();
+  if (preGate.blocked) {
+    log.warn(`Capacity gate active — rejecting request fast (would wait ${Math.ceil(preGate.waitMs / 1000)}s)`);
+    return res.status(503).json({ error: 'Service temporarily at capacity', retry_after: Math.ceil(preGate.waitMs / 1000) });
+  }
+
+  // === CONCURRENCY LIMIT ===
+  await acquireSlot();
+  try {
+    return await _withPoolInner({ res, buildUrl, body, stream, model, endpoint, clientRequest });
+  } finally {
+    releaseSlot();
+  }
+}
+
+async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, clientRequest }) {
   const startedAt = Date.now();
   const clientReq = clientRequest ?? captureBody(body);
 
