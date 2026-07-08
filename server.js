@@ -359,6 +359,23 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
     }
   }
 
+  // Determine if failure was due to capacity (503) or other (502)
+  const gateInfo = pool.getCapacityGateInfo();
+  const isCapacityFailure = gateInfo.gate_active || gateInfo.gate_consecutive > 0;
+
+  if (isCapacityFailure) {
+    // 503 = "Service Unavailable" + Retry-After so clients back off properly
+    const retryAfterSec = Math.ceil((gateInfo.gate_remaining_ms || gateInfo.gate_cooldown_ms) / 1000);
+    res.set('Retry-After', String(retryAfterSec));
+    record(null, 503, { error: 'CF capacity exhausted', retry_after: retryAfterSec });
+    if (res.headersSent) return res.end();
+    return res.status(503).json({
+      error: 'Cloudflare capacity exhausted — retry later',
+      retry_after_seconds: retryAfterSec,
+      pool: pool.stats()
+    });
+  }
+
   record(null, 502, { error: 'All retries failed' });
   if (res.headersSent) return res.end();
   return res.status(502).json({ error: 'All retries failed', pool: pool.stats() });
