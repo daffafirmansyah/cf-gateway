@@ -21,15 +21,16 @@ const NINE_DB = process.env.CF_GATEWAY_9ROUTER_DB || join(process.env.HOME || ''
 const OWN_DB = process.env.CF_GATEWAY_DB || join(__dirname, 'data', 'accounts.db');
 const API_KEY = process.env.CF_GATEWAY_API_KEY || '';
 const COOLDOWN_429 = parseInt(process.env.CF_GATEWAY_COOLDOWN_429 || '90', 10);
-const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '50', 10);
-const RETRY_DELAY_MS = parseInt(process.env.CF_GATEWAY_RETRY_DELAY_MS || '3000', 10);
+const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '20', 10);
+const RETRY_DELAY_MS = parseInt(process.env.CF_GATEWAY_RETRY_DELAY_MS || '1000', 10);
+const REQUEST_DEADLINE_MS = parseInt(process.env.CF_GATEWAY_REQUEST_DEADLINE_MS || '120000', 10);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const startedAt = Date.now();
 let lastSuccessAt = null;
 
 // --- Concurrency limiter ---
-const MAX_CONCURRENT = parseInt(process.env.CF_GATEWAY_MAX_CONCURRENT || '2', 10);
+const MAX_CONCURRENT = parseInt(process.env.CF_GATEWAY_MAX_CONCURRENT || '4', 10);
 let _inFlight = 0;
 const _waitQueue = [];
 function acquireSlot() {
@@ -39,70 +40,6 @@ function acquireSlot() {
 function releaseSlot() {
   if (_waitQueue.length > 0) { _waitQueue.shift()(); }
   else { _inFlight--; }
-}
-
-// --- Request Queue (priority: stream > normal) ---
-const QUEUE_MAX = parseInt(process.env.CF_GATEWAY_QUEUE_MAX || '50', 10);
-const QUEUE_TIMEOUT_MS = parseInt(process.env.CF_GATEWAY_QUEUE_TIMEOUT_MS || '60000', 10);
-const _requestQueue = []; // { priority, enqueuedAt, resolve, reject, timer }
-let _queueProcessorRunning = false;
-
-function enqueueRequest({ stream, res, runFn }) {
-  return new Promise((resolve, reject) => {
-    if (_requestQueue.length >= QUEUE_MAX) {
-      return reject(Object.assign(new Error('queue_full'), { code: 'QUEUE_FULL' }));
-    }
-
-    const priority = stream ? 1 : 2; // 1=high (stream), 2=normal
-    const enqueuedAt = Date.now();
-
-    const timer = setTimeout(() => {
-      const idx = _requestQueue.findIndex(e => e.enqueuedAt === enqueuedAt);
-      if (idx !== -1) _requestQueue.splice(idx, 1);
-      reject(Object.assign(new Error('queue_timeout'), { code: 'QUEUE_TIMEOUT' }));
-    }, QUEUE_TIMEOUT_MS);
-
-    const entry = { priority, enqueuedAt, resolve, reject, timer, runFn, stream };
-    // Insert sorted by priority (lower number = higher priority)
-    let inserted = false;
-    for (let i = 0; i < _requestQueue.length; i++) {
-      if (_requestQueue[i].priority > priority) {
-        _requestQueue.splice(i, 0, entry);
-        inserted = true;
-        break;
-      }
-    }
-    if (!inserted) _requestQueue.push(entry);
-
-    log.info(`Request queued (priority=${priority}, queue_size=${_requestQueue.length})`);
-    _processQueue();
-  });
-}
-
-async function _processQueue() {
-  if (_queueProcessorRunning) return;
-  _queueProcessorRunning = true;
-  try {
-    while (_requestQueue.length > 0) {
-      const gate = pool.checkCapacityGate();
-      if (gate.blocked) {
-        log.info(`Queue processor: gate active, waiting ${Math.ceil(gate.waitMs / 1000)}s`);
-        await sleep(gate.waitMs);
-        continue;
-      }
-      const entry = _requestQueue.shift();
-      if (!entry) break;
-      clearTimeout(entry.timer);
-      try {
-        await entry.runFn();
-        entry.resolve();
-      } catch (e) {
-        entry.reject(e);
-      }
-    }
-  } finally {
-    _queueProcessorRunning = false;
-  }
 }
 
 // --- Logger ---
@@ -118,6 +55,32 @@ const log = {
 const db = initDb(OWN_DB);
 const pool = new AccountPool(db, { cooldown429: COOLDOWN_429, log });
 const requestLog = new RequestLog({ capacity: 500 });
+
+// --- Sync modelLocks from 9router (disabled by default) ---
+const SYNC_INTERVAL_MS = parseInt(process.env.CF_GATEWAY_SYNC_INTERVAL_MS || '30000', 10);
+const SYNC_LOCKS = process.env.CF_GATEWAY_SYNC_LOCKS === 'true';
+function doSync() {
+  if (!SYNC_LOCKS) return;
+  const result = pool.syncModelLocks(NINE_DB);
+  if (result.synced > 0) {
+    log.info(`modelLock sync: ${result.synced}/${result.total} accounts locked`);
+  }
+}
+if (SYNC_LOCKS) {
+  doSync(); // initial sync
+  setInterval(doSync, SYNC_INTERVAL_MS);
+} else {
+  log.info('modelLock sync: DISABLED (set CF_GATEWAY_SYNC_LOCKS=true to enable)');
+}
+
+// --- Backoff decay --- decay stuck backoff levels every 5 minutes
+const DECAY_INTERVAL_MS = parseInt(process.env.CF_GATEWAY_DECAY_INTERVAL_MS || '300000', 10);
+const DECAY_THRESHOLD_SEC = parseInt(process.env.CF_GATEWAY_DECAY_THRESHOLD_SEC || '600', 10);
+function doDecay() {
+  pool.decayBackoff(DECAY_THRESHOLD_SEC);
+}
+doDecay(); // initial decay
+setInterval(doDecay, DECAY_INTERVAL_MS);
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -138,7 +101,6 @@ const PROTECTED = ['/v1', '/api', '/ai'];
 app.use((req, res, next) => {
   if (!API_KEY) return next();
   const path = req.path.toLowerCase();
-  // Dashboard HTML (GET /) — no auth needed
   if (path === '/' || path === '/index.html') return next();
   const guarded = PROTECTED.some((p) => path === p || path.startsWith(p + '/'));
   if (!guarded) return next();
@@ -165,31 +127,8 @@ function flattenContent(messages) {
   return messages;
 }
 
-// --- Core: retry across pool on 429 ---
+// --- Core: retry across pool on 429 (no gate, no backoff — like 9router) ---
 async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRequest }) {
-  // === FAST GATE CHECK — queue instead of reject ===
-  const preGate = pool.checkCapacityGate();
-  if (preGate.blocked) {
-    log.warn(`Capacity gate active — queuing request (would wait ${Math.ceil(preGate.waitMs / 1000)}s)`);
-    try {
-      await enqueueRequest({
-        stream,
-        res,
-        runFn: () => _withPoolInner({ res, buildUrl, body, stream, model, endpoint, clientRequest }),
-      });
-      return; // resolved by queue processor
-    } catch (e) {
-      if (e.code === 'QUEUE_FULL') {
-        return res.status(503).json({ error: 'Queue full — try again later', queue_size: _requestQueue.length });
-      }
-      if (e.code === 'QUEUE_TIMEOUT') {
-        return res.status(504).json({ error: 'Queue timeout — request waited too long', timeout_ms: QUEUE_TIMEOUT_MS });
-      }
-      throw e;
-    }
-  }
-
-  // === CONCURRENCY LIMIT ===
   await acquireSlot();
   try {
     return await _withPoolInner({ res, buildUrl, body, stream, model, endpoint, clientRequest });
@@ -199,7 +138,7 @@ async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRe
 }
 
 async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, clientRequest }) {
-  const startedAt = Date.now();
+  const reqStartedAt = Date.now();
   const clientReq = clientRequest ?? captureBody(body);
 
   const record = (account, status, extra = {}) => {
@@ -210,36 +149,24 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
       account_name: account?.name ?? null,
       status,
       stream,
-      latency_ms: Date.now() - startedAt,
+      latency_ms: Date.now() - reqStartedAt,
       client_request: clientReq,
       provider_request: captureBody(body),
       ...extra,
     });
   };
 
-  let capacityBackoffMs = 0; // exponential backoff tracker for capacity errors
-
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    // === GLOBAL CAPACITY GATE CHECK ===
-    // If CF backend is overloaded, wait for gate to clear before trying ANY account
-    const gate = pool.checkCapacityGate();
-    if (gate.blocked) {
-      log.info(`Capacity gate active — waiting ${Math.ceil(gate.waitMs / 1000)}s before retry (attempt ${attempt + 1}/${MAX_RETRIES})`);
-      await sleep(gate.waitMs);
+    // Deadline check — prevent infinite retry holding slot
+    if (Date.now() - reqStartedAt > REQUEST_DEADLINE_MS) {
+      log.warn(`Deadline exceeded (${Math.ceil((Date.now() - reqStartedAt) / 1000)}s) after ${attempt} attempts`);
+      record(null, 504, { error: 'Request deadline exceeded', attempts: attempt });
+      return res.status(504).json({ error: 'Request deadline exceeded', attempts: attempt });
     }
 
     const account = pool.getAvailable();
     if (!account) {
-      // No accounts available — check if it's temporary (all in cooldown) or permanent
-      const gateInfo = pool.getCapacityGateInfo();
-      if (gateInfo.gate_active) {
-        // All accounts burned by capacity errors — wait and retry (don't count as attempt)
-        log.warn(`No available accounts during capacity gate — waiting ${Math.ceil(gateInfo.gate_remaining_ms / 1000)}s`);
-        await sleep(gateInfo.gate_remaining_ms);
-        attempt--; // don't count this as a real attempt
-        continue;
-      }
-      record(null, 503, { error: 'No available accounts', provider_request: null });
+      record(null, 503, { error: 'No available accounts' });
       return res.status(503).json({ error: 'No available accounts', pool: pool.stats() });
     }
 
@@ -251,38 +178,27 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
 
     try {
       if (stream) {
-        // Try opening stream BEFORE sending headers — allows retry on 429
         const opened = await openStream(url, account.api_key, body);
         if (opened.status === 429) {
-          const errInfo = opened.text ? opened.text.slice(0, 200) : '';
           log.warn(`Account ${account.name} stream 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${opened.errorCode}`);
-          record(account, 429, { error_code: opened.errorCode, error: errInfo });
+          record(account, 429, { error_code: opened.errorCode });
           pool.mark429(account.id, opened.errorCode, opened.text);
           release();
-          // Exponential backoff for capacity errors
-          const isCapacity = opened.errorCode === 4006 || opened.errorCode === 3040;
-          if (isCapacity) {
-            capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 120000) : RETRY_DELAY_MS;
-            if (attempt < MAX_RETRIES - 1) await sleep(capacityBackoffMs);
-          } else {
-            if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
-          }
-          continue; // retry with next account
+          continue; // immediately try next account
         }
         if (opened.status >= 400) {
-          log.warn(`Account ${account.name} stream -> ${opened.status}: ${opened.text?.slice(0, 200)}`);
+          log.warn(`Account ${account.name} stream -> ${opened.status}`);
           record(account, opened.status, { error: opened.text?.slice(0, 200) });
           release();
-          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
-          continue; // retry
+          continue;
         }
 
-        // Stream opened successfully — NOW send headers
+        // Stream opened — send headers
         res.status(200);
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('X-Accel-Buffering', 'no');
-        res.setHeader('X-CF-Gateway-Account', account.name || String(account.id));
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.setHeader("X-CF-Gateway-Account", account.name || String(account.id));
         res.flushHeaders();
 
         let realDataStarted = false;
@@ -296,7 +212,7 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
         };
         const { usage } = await pumpStream(opened.stream, writeChunk);
         clearInterval(heartbeat);
-        log.info(`Account ${account.name} stream -> 200 (attempt ${attempt + 1})`);
+        log.info(`Account ${account.name} stream -> 200`);
         record(account, 200, { usage });
         pool.markSuccess(account.id, model, usage);
         lastSuccessAt = new Date().toISOString();
@@ -306,18 +222,13 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
       // Non-streaming
       const result = await callNormal(url, account.api_key, body);
       if (result.status === 429) {
-        const errInfo = result.text ? result.text.slice(0, 200) : '';
-        log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode} body=${errInfo}`);
-        record(account, 429, { error_code: result.errorCode, error: errInfo });
+        log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode}`);
+        record(account, 429, { error_code: result.errorCode });
         pool.mark429(account.id, result.errorCode, result.text);
-        // Exponential backoff for capacity errors, flat delay for rate limits
+        // No delay for capacity errors (4006/3040) — immediately try next
+        // Small delay only for per-minute rate limits
         const isCapacity = result.errorCode === 4006 || result.errorCode === 3040;
-        if (isCapacity) {
-          capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 120000) : RETRY_DELAY_MS;
-          if (attempt < MAX_RETRIES - 1) await sleep(capacityBackoffMs);
-        } else {
-          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
-        }
+        if (!isCapacity && attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
         continue;
       }
       if (result.status === 403) {
@@ -327,14 +238,13 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
         continue;
       }
       if (result.status >= 500) {
-        log.warn(`Account ${account.name} -> ${result.status}: ${result.text?.slice(0, 200)}`);
+        log.warn(`Account ${account.name} -> ${result.status}`);
         record(account, result.status, { error: result.text?.slice(0, 200) });
         pool.markError(account.id);
-        if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
         continue;
       }
       if (result.status >= 400) {
-        log.warn(`Account ${account.name} -> ${result.status}: ${result.text?.slice(0, 200)}`);
+        log.warn(`Account ${account.name} -> ${result.status}`);
         record(account, result.status, { error: result.text?.slice(0, 200) });
         return res.status(result.status).type('application/json').send(result.text);
       }
@@ -353,23 +263,6 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
     }
   }
 
-  // Determine if failure was due to capacity (503) or other (502)
-  const gateInfo = pool.getCapacityGateInfo();
-  const isCapacityFailure = gateInfo.gate_active || gateInfo.gate_consecutive > 0;
-
-  if (isCapacityFailure) {
-    // 503 = "Service Unavailable" + Retry-After so clients back off properly
-    const retryAfterSec = Math.ceil((gateInfo.gate_remaining_ms || gateInfo.gate_cooldown_ms) / 1000);
-    res.set('Retry-After', String(retryAfterSec));
-    record(null, 503, { error: 'CF capacity exhausted', retry_after: retryAfterSec });
-    if (res.headersSent) return res.end();
-    return res.status(503).json({
-      error: 'Cloudflare capacity exhausted — retry later',
-      retry_after_seconds: retryAfterSec,
-      pool: pool.stats()
-    });
-  }
-
   record(null, 502, { error: 'All retries failed' });
   if (res.headersSent) return res.end();
   return res.status(502).json({ error: 'All retries failed', pool: pool.stats() });
@@ -377,18 +270,13 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
 
 // === ROUTES ===
 
-// Health — enhanced
+// Health
 app.get('/health', (_req, res) => {
   const stats = pool.stats();
-  const gate = stats.capacity_gate || {};
   const uptime = Math.floor((Date.now() - startedAt) / 1000);
-
-  // Status logic
   let status = 'ok';
   if (stats.available === 0) status = 'down';
-  else if (gate.gate_active) status = 'degraded';
   else if (stats.cooldown > stats.total * 0.5) status = 'degraded';
-
   const code = status === 'down' ? 503 : 200;
   res.status(code).json({
     status,
@@ -406,25 +294,16 @@ app.get('/health', (_req, res) => {
       remaining_today: stats.neurons_remaining_today,
     },
     requests_today: stats.requests_today,
-    capacity_gate: {
-      active: gate.gate_active || false,
-      remaining_ms: gate.gate_remaining_ms || 0,
-    },
     concurrency: {
       max: MAX_CONCURRENT,
       in_flight: _inFlight,
       queued: _waitQueue.length,
     },
-    queue: {
-      size: _requestQueue.length,
-      max: QUEUE_MAX,
-      timeout_ms: QUEUE_TIMEOUT_MS,
-    },
     last_success: lastSuccessAt,
   });
 });
 
-// OpenAI: /v1/models — live from CF API
+// OpenAI: /v1/models
 app.get('/v1/models', async (_req, res) => {
   try {
     const models = await getModels(pickAccount, log.warn);
@@ -442,7 +321,7 @@ app.get('/v1/models', async (_req, res) => {
   }
 });
 
-// Admin: /api/models — raw with metadata
+// Admin: /api/models
 app.get('/api/models', async (req, res) => {
   try {
     const fresh = req.query.fresh === '1';
@@ -459,22 +338,12 @@ app.post('/v1/chat/completions', async (req, res) => {
   const body = req.body;
   if (!body || typeof body !== 'object') return res.status(400).json({ error: 'Invalid JSON' });
   if (!body.model) return res.status(400).json({ error: 'model required' });
-
   const clientRequest = captureBody(body);
   const r = await resolveModel(body.model);
   if (r.error) return res.status(r.status).json({ error: r.error });
   body.model = r.id;
   if (Array.isArray(body.messages)) body.messages = flattenContent(body.messages);
-
-  return withPool({
-    res,
-    buildUrl: (id) => chatUrl(id),
-    body,
-    model: r.id,
-    stream: body.stream === true,
-    endpoint: 'chat',
-    clientRequest,
-  });
+  return withPool({ res, buildUrl: (id) => chatUrl(id), body, model: r.id, stream: body.stream === true, endpoint: 'chat', clientRequest });
 });
 
 // OpenAI: /v1/embeddings
@@ -482,149 +351,60 @@ app.post('/v1/embeddings', async (req, res) => {
   const body = req.body;
   if (!body || typeof body !== 'object') return res.status(400).json({ error: 'Invalid JSON' });
   if (!body.model) return res.status(400).json({ error: 'model required' });
-
   const clientRequest = captureBody(body);
   const r = await resolveModel(body.model);
   if (r.error) return res.status(r.status).json({ error: r.error });
   body.model = r.id;
-
-  return withPool({
-    res,
-    buildUrl: (id) => embeddingsUrl(id),
-    body,
-    model: r.id,
-    stream: false,
-    endpoint: 'embeddings',
-    clientRequest,
-  });
-});
-
-// CF passthrough: /ai/run/*
-app.post('/ai/run/*', async (req, res) => {
-  const model = req.params[0];
-  if (!model) return res.status(400).json({ error: 'model required in path' });
-  const body = req.body ?? {};
-  const clientRequest = captureBody({ model, ...body });
-  const r = await resolveModel(model);
-  if (r.error) return res.status(r.status).json({ error: r.error });
-
-  return withPool({
-    res,
-    buildUrl: (id) => runUrl(id, r.id),
-    body,
-    model: r.id,
-    stream: false,
-    endpoint: 'run',
-    clientRequest,
-  });
-});
-
-// Admin: /api/stats
-app.get('/api/stats', (_req, res) => {
-  const stats = pool.stats();
-  stats.queue = { size: _requestQueue.length, max: QUEUE_MAX, timeout_ms: QUEUE_TIMEOUT_MS };
-  stats.concurrency = { max: MAX_CONCURRENT, in_flight: _inFlight, queued: _waitQueue.length };
-  stats.last_success = lastSuccessAt;
-  res.json(stats);
-});
-
-// Admin: /api/accounts
-function shapeAccount(row) {
-  const today = todayUTC();
-  const usedToday = row.neurons_day === today ? row.neurons_today : 0;
-  const reqsToday = row.neurons_day === today ? row.requests_today : 0;
-  const now = Date.now() / 1000;
-  const inCooldown = row.cooldown_until > now;
-  let status = 'available';
-  if (!row.is_active) status = 'inactive';
-  else if (usedToday >= NEURON_FREE_DAILY) status = 'exhausted';
-  else if (inCooldown) status = 'cooldown';
-  return {
-    id: row.id,
-    name: row.name,
-    account_id: row.account_id.slice(0, 8),
-    is_active: !!row.is_active,
-    status,
-    neurons_today: Math.round(usedToday),
-    neurons_remaining: Math.max(0, Math.round(NEURON_FREE_DAILY - usedToday)),
-    neurons_free_daily: NEURON_FREE_DAILY,
-    requests_today: reqsToday,
-    cooldown_seconds: inCooldown ? Math.round(row.cooldown_until - now) : 0,
-  };
-}
-
-app.get('/api/accounts', (_req, res) => {
-  const rows = db.prepare('SELECT * FROM accounts ORDER BY id').all();
-  const accounts = rows.map(shapeAccount);
-  // Sort: available first, then cooldown, then exhausted/inactive
-  const order = { available: 0, cooldown: 1, exhausted: 2, inactive: 3 };
-  accounts.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || a.id - b.id);
-  res.json({ accounts, stats: pool.stats() });
+  return withPool({ res, buildUrl: (id) => embeddingsUrl(id), body, model: r.id, stream: false, endpoint: 'embeddings', clientRequest });
 });
 
 // Admin: /api/import
 app.post('/api/import', (_req, res) => {
   try {
-    const result = importFrom9router(db, NINE_DB, log);
+    const result = importFrom9router(NINE_DB, db);
+    invalidateModels();
+    log.info(`Import: ${result.imported} imported, ${result.skipped} skipped, ${result.total} total`);
     res.json(result);
   } catch (e) {
-    log.error(`import failed: ${e.message}`);
+    log.error(`Import failed: ${e.message}`);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Admin: POST /api/accounts — add single account
-app.post('/api/accounts', (req, res) => {
-  const { name, api_key, account_id } = req.body || {};
-  if (!api_key || !account_id) return res.status(400).json({ error: 'api_key and account_id required' });
-  try {
-    const ins = db.prepare('INSERT OR IGNORE INTO accounts (name, api_key, account_id) VALUES (?, ?, ?)');
-    const r = ins.run(name || `cf-${account_id.slice(0, 6)}`, api_key, account_id);
-    if (r.changes === 0) return res.status(409).json({ error: 'Account already exists' });
-    log.info(`Added account ${name || account_id.slice(0, 8)}`);
-    res.json({ ok: true, id: r.lastInsertRowid });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+// Admin: /api/stats
+app.get('/api/stats', (_req, res) => {
+  res.json({ ...pool.stats(), last_success: lastSuccessAt, uptime: Math.floor((Date.now() - startedAt) / 1000) });
 });
 
-// Admin: DELETE /api/accounts/:id — remove account
-app.delete('/api/accounts/:id', (req, res) => {
-  const r = db.prepare('DELETE FROM accounts WHERE id = ?').run(req.params.id);
-  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
-  log.info(`Deleted account #${req.params.id}`);
-  res.json({ ok: true });
-});
-
-// Admin: POST /api/accounts/bulk — bulk import from JSON array
-app.post('/api/accounts/bulk', (req, res) => {
-  const { accounts } = req.body || {};
-  if (!Array.isArray(accounts)) return res.status(400).json({ error: 'accounts array required' });
-  const ins = db.prepare('INSERT OR IGNORE INTO accounts (name, api_key, account_id) VALUES (?, ?, ?)');
-  let imported = 0, skipped = 0;
-  for (const a of accounts) {
-    if (!a.api_key || !a.account_id) { skipped++; continue; }
-    const r = ins.run(a.name || `cf-${a.account_id.slice(0, 6)}`, a.api_key, a.account_id);
-    if (r.changes > 0) imported++; else skipped++;
-  }
-  log.info(`Bulk import: ${imported} added, ${skipped} skipped`);
-  res.json({ imported, skipped, total: db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c });
+// Admin: /api/accounts
+app.get('/api/accounts', (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const perPage = Math.min(100, Math.max(1, parseInt(req.query.per_page || '20', 10)));
+  const offset = (page - 1) * perPage;
+  const rows = db.prepare('SELECT * FROM accounts ORDER BY id LIMIT ? OFFSET ?').all(perPage, offset);
+  const total = db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c;
+  res.json({ accounts: rows, page, per_page: perPage, total, total_pages: Math.ceil(total / perPage) });
 });
 
 // Admin: /api/logs
-app.get('/api/logs', (_req, res) => res.json({ logs: requestLog.all() }));
-app.delete('/api/logs', (_req, res) => { requestLog.clear(); res.json({ cleared: true }); });
+app.get('/api/logs', (_req, res) => {
+  res.json({ logs: requestLog.all(), count: requestLog.all().length });
+});
+app.delete('/api/logs', (_req, res) => {
+  requestLog.clear();
+  res.json({ ok: true });
+});
 
-// Dashboard (static HTML)
-const indexPath = join(__dirname, 'public', 'index.html');
-if (existsSync(indexPath)) {
-  app.use(express.static(join(__dirname, 'public'), { maxAge: 0 }));
-  app.get('/', (_req, res) => res.sendFile(indexPath));
-}
+// Dashboard
+app.get('/', (_req, res) => {
+  const htmlPath = join(__dirname, 'public', 'index.html');
+  if (existsSync(htmlPath)) {
+    res.type('html').send(readFileSync(htmlPath, 'utf-8'));
+  } else {
+    res.type('html').send('<h1>CF Gateway</h1><p>Dashboard not built. See /health</p>');
+  }
+});
 
-// --- Start ---
-const stats = pool.stats();
 app.listen(PORT, HOST, () => {
-  log.info(`cf-gateway ready on ${HOST}:${PORT} — ${stats.total} accounts (${stats.available} available)`);
-  if (stats.total === 0) log.info('pool empty — POST /api/import to load accounts from 9router DB');
+  log.info(`CF Gateway listening on ${HOST}:${PORT} — ${MAX_RETRIES} retries, ${MAX_CONCURRENT} concurrent, ${REQUEST_DEADLINE_MS / 1000}s deadline`);
 });
