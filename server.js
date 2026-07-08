@@ -24,6 +24,8 @@ const MAX_RETRIES = parseInt(process.env.CF_GATEWAY_MAX_RETRIES || '8', 10);
 const RETRY_DELAY_MS = parseInt(process.env.CF_GATEWAY_RETRY_DELAY_MS || '3000', 10);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const startedAt = Date.now();
+let lastSuccessAt = null;
 
 // --- Concurrency limiter ---
 const MAX_CONCURRENT = parseInt(process.env.CF_GATEWAY_MAX_CONCURRENT || '2', 10);
@@ -36,6 +38,70 @@ function acquireSlot() {
 function releaseSlot() {
   if (_waitQueue.length > 0) { _waitQueue.shift()(); }
   else { _inFlight--; }
+}
+
+// --- Request Queue (priority: stream > normal) ---
+const QUEUE_MAX = parseInt(process.env.CF_GATEWAY_QUEUE_MAX || '50', 10);
+const QUEUE_TIMEOUT_MS = parseInt(process.env.CF_GATEWAY_QUEUE_TIMEOUT_MS || '60000', 10);
+const _requestQueue = []; // { priority, enqueuedAt, resolve, reject, timer }
+let _queueProcessorRunning = false;
+
+function enqueueRequest({ stream, res, runFn }) {
+  return new Promise((resolve, reject) => {
+    if (_requestQueue.length >= QUEUE_MAX) {
+      return reject(Object.assign(new Error('queue_full'), { code: 'QUEUE_FULL' }));
+    }
+
+    const priority = stream ? 1 : 2; // 1=high (stream), 2=normal
+    const enqueuedAt = Date.now();
+
+    const timer = setTimeout(() => {
+      const idx = _requestQueue.findIndex(e => e.enqueuedAt === enqueuedAt);
+      if (idx !== -1) _requestQueue.splice(idx, 1);
+      reject(Object.assign(new Error('queue_timeout'), { code: 'QUEUE_TIMEOUT' }));
+    }, QUEUE_TIMEOUT_MS);
+
+    const entry = { priority, enqueuedAt, resolve, reject, timer, runFn, stream };
+    // Insert sorted by priority (lower number = higher priority)
+    let inserted = false;
+    for (let i = 0; i < _requestQueue.length; i++) {
+      if (_requestQueue[i].priority > priority) {
+        _requestQueue.splice(i, 0, entry);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) _requestQueue.push(entry);
+
+    log.info(`Request queued (priority=${priority}, queue_size=${_requestQueue.length})`);
+    _processQueue();
+  });
+}
+
+async function _processQueue() {
+  if (_queueProcessorRunning) return;
+  _queueProcessorRunning = true;
+  try {
+    while (_requestQueue.length > 0) {
+      const gate = pool.checkCapacityGate();
+      if (gate.blocked) {
+        log.info(`Queue processor: gate active, waiting ${Math.ceil(gate.waitMs / 1000)}s`);
+        await sleep(gate.waitMs);
+        continue;
+      }
+      const entry = _requestQueue.shift();
+      if (!entry) break;
+      clearTimeout(entry.timer);
+      try {
+        await entry.runFn();
+        entry.resolve();
+      } catch (e) {
+        entry.reject(e);
+      }
+    }
+  } finally {
+    _queueProcessorRunning = false;
+  }
 }
 
 // --- Logger ---
@@ -67,7 +133,7 @@ app.use((err, _req, res, next) => {
 });
 
 // Bearer auth on API/proxy paths
-const PROTECTED = ['/v1', '/api', '/health', '/ai'];
+const PROTECTED = ['/v1', '/api', '/ai'];
 app.use((req, res, next) => {
   if (!API_KEY) return next();
   const path = req.path.toLowerCase();
@@ -104,11 +170,26 @@ function flattenContent(messages) {
 
 // --- Core: retry across pool on 429 ---
 async function withPool({ res, buildUrl, body, stream, model, endpoint, clientRequest }) {
-  // === FAST GATE CHECK — reject immediately if CF is overloaded ===
+  // === FAST GATE CHECK — queue instead of reject ===
   const preGate = pool.checkCapacityGate();
   if (preGate.blocked) {
-    log.warn(`Capacity gate active — rejecting request fast (would wait ${Math.ceil(preGate.waitMs / 1000)}s)`);
-    return res.status(503).json({ error: 'Service temporarily at capacity', retry_after: Math.ceil(preGate.waitMs / 1000) });
+    log.warn(`Capacity gate active — queuing request (would wait ${Math.ceil(preGate.waitMs / 1000)}s)`);
+    try {
+      await enqueueRequest({
+        stream,
+        res,
+        runFn: () => _withPoolInner({ res, buildUrl, body, stream, model, endpoint, clientRequest }),
+      });
+      return; // resolved by queue processor
+    } catch (e) {
+      if (e.code === 'QUEUE_FULL') {
+        return res.status(503).json({ error: 'Queue full — try again later', queue_size: _requestQueue.length });
+      }
+      if (e.code === 'QUEUE_TIMEOUT') {
+        return res.status(504).json({ error: 'Queue timeout — request waited too long', timeout_ms: QUEUE_TIMEOUT_MS });
+      }
+      throw e;
+    }
   }
 
   // === CONCURRENCY LIMIT ===
@@ -224,6 +305,7 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
         log.info(`Account ${account.name} stream -> 200 (attempt ${attempt + 1})`);
         record(account, 200, { usage: result.usage });
         pool.markSuccess(account.id, model, result.usage);
+        lastSuccessAt = new Date().toISOString();
         return res.end();
       }
 
@@ -265,6 +347,7 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
       log.info(`Account ${account.name} -> 200 (attempt ${attempt + 1})`);
       record(account, 200, { usage: result.usage });
       pool.markSuccess(account.id, model, result.usage);
+      lastSuccessAt = new Date().toISOString();
       return res.json(result.json);
     } catch (e) {
       log.warn(`Account ${account.name} error: ${e.message}`);
@@ -283,8 +366,52 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
 
 // === ROUTES ===
 
-// Health
-app.get('/health', (_req, res) => res.json({ status: 'ok', pool: pool.stats() }));
+// Health — enhanced
+app.get('/health', (_req, res) => {
+  const stats = pool.stats();
+  const gate = stats.capacity_gate || {};
+  const uptime = Math.floor((Date.now() - startedAt) / 1000);
+
+  // Status logic
+  let status = 'ok';
+  if (stats.available === 0) status = 'down';
+  else if (gate.gate_active) status = 'degraded';
+  else if (stats.cooldown > stats.total * 0.5) status = 'degraded';
+
+  const code = status === 'down' ? 503 : 200;
+  res.status(code).json({
+    status,
+    uptime,
+    accounts: {
+      total: stats.total,
+      available: stats.available,
+      cooldown: stats.cooldown,
+      exhausted: stats.exhausted,
+      inactive: stats.inactive,
+    },
+    neurons: {
+      used_today: stats.neurons_used_today,
+      capacity_today: stats.neurons_capacity_today,
+      remaining_today: stats.neurons_remaining_today,
+    },
+    requests_today: stats.requests_today,
+    capacity_gate: {
+      active: gate.gate_active || false,
+      remaining_ms: gate.gate_remaining_ms || 0,
+    },
+    concurrency: {
+      max: MAX_CONCURRENT,
+      in_flight: _inFlight,
+      queued: _waitQueue.length,
+    },
+    queue: {
+      size: _requestQueue.length,
+      max: QUEUE_MAX,
+      timeout_ms: QUEUE_TIMEOUT_MS,
+    },
+    last_success: lastSuccessAt,
+  });
+});
 
 // OpenAI: /v1/models
 app.get('/v1/models', (_req, res) => {
@@ -371,7 +498,13 @@ app.post('/ai/run/*', async (req, res) => {
 });
 
 // Admin: /api/stats
-app.get('/api/stats', (_req, res) => res.json(pool.stats()));
+app.get('/api/stats', (_req, res) => {
+  const stats = pool.stats();
+  stats.queue = { size: _requestQueue.length, max: QUEUE_MAX, timeout_ms: QUEUE_TIMEOUT_MS };
+  stats.concurrency = { max: MAX_CONCURRENT, in_flight: _inFlight, queued: _waitQueue.length };
+  stats.last_success = lastSuccessAt;
+  res.json(stats);
+});
 
 // Admin: /api/accounts
 function shapeAccount(row) {
