@@ -8,8 +8,9 @@ import { initDb } from './lib/db.js';
 import { AccountPool } from './lib/pool.js';
 import { RequestLog, captureBody } from './lib/log.js';
 import { importFrom9router } from './lib/importer.js';
-import { chatUrl, embeddingsUrl, runUrl, callNormal, callStream } from './lib/cf.js';
+import { chatUrl, embeddingsUrl, runUrl, callNormal, openStream, pumpStream } from './lib/cf.js';
 import { NEURON_FREE_DAILY, todayUTC } from './lib/neurons.js';
+import { getModels, resolveModel as resolveModelLive, invalidateModels } from './lib/models.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -145,15 +146,11 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: 'Unauthorized' });
 });
 
-// --- Model resolution (simple — no cache needed, just prefix @cf/) ---
-function resolveModel(input) {
-  if (!input || typeof input !== 'string') return { error: 'model required', status: 400 };
-  const s = input.trim();
-  if (!s) return { error: 'model required', status: 400 };
-  if (s.startsWith('@cf/')) return { id: s };
-  if (s.includes('/')) return { id: `@cf/${s}` };
-  // Short ID — pass through (CF will reject if invalid)
-  return { id: s };
+// --- Model resolution (live from CF API, cached 10min) ---
+const pickAccount = () => pool.peekAccount();
+
+async function resolveModel(input) {
+  return resolveModelLive(input, pickAccount, log.warn);
 }
 
 // --- Flatten OpenAI content arrays to string (CF rejects multipart) ---
@@ -254,57 +251,49 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
 
     try {
       if (stream) {
-        let prepared = false;
-        const result = await callStream(url, account.api_key, body, (chunk) => {
-          if (!prepared) {
-            res.status(200);
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('X-CF-Gateway-Account', account.name || String(account.id));
-            prepared = true;
-          }
-          if (!res.write(chunk)) return new Promise((r) => res.once('drain', r));
-        });
+        // Commit 200 SSE up-front + heartbeat ping for slow TTFB models (glm-5.2: 40-80s)
+        res.status(200);
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('X-CF-Gateway-Account', account.name || String(account.id));
+        res.flushHeaders();
 
-        if (result.status === 429) {
-          const errInfo = result.text ? result.text.slice(0, 200) : '';
-          log.warn(`Account ${account.name} 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${result.errorCode} body=${errInfo}`);
-          record(account, 429, { error_code: result.errorCode, error: errInfo });
-          pool.mark429(account.id, result.errorCode, result.text);
-          // Exponential backoff for capacity errors, flat delay for rate limits
-          const isCapacity = result.errorCode === 4006 || result.errorCode === 3040;
-          if (isCapacity) {
-            capacityBackoffMs = capacityBackoffMs ? Math.min(capacityBackoffMs * 2, 30000) : RETRY_DELAY_MS;
-            if (attempt < MAX_RETRIES - 1) await sleep(capacityBackoffMs);
-          } else {
-            if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
-          }
-          continue;
+        let realDataStarted = false;
+        const heartbeat = setInterval(() => {
+          if (!realDataStarted && !res.writableEnded) res.write(': ping\n');
+        }, 15000);
+
+        const opened = await openStream(url, account.api_key, body);
+        if (opened.status === 429) {
+          clearInterval(heartbeat);
+          const errInfo = opened.text ? opened.text.slice(0, 200) : '';
+          log.warn(`Account ${account.name} stream 429 (attempt ${attempt + 1}/${MAX_RETRIES}) errorCode=${opened.errorCode}`);
+          record(account, 429, { error_code: opened.errorCode, error: errInfo });
+          pool.mark429(account.id, opened.errorCode, opened.text);
+          // Headers already sent — surface error as SSE event
+          res.write(`data: {"error":"rate_limited","code":${opened.errorCode ?? 429}}\n\n`);
+          res.write('data: [DONE]\n\n');
+          return res.end();
         }
-        if (result.status === 403) {
-          // Bad API key or suspended — deactivate and try next account
-          log.warn(`Account ${account.name} 403 — deactivating`);
-          record(account, 403, { error: result.text?.slice(0, 200) });
-          pool.deactivate(account.id);
-          continue;
+        if (opened.status >= 400) {
+          clearInterval(heartbeat);
+          log.warn(`Account ${account.name} stream -> ${opened.status}: ${opened.text?.slice(0, 200)}`);
+          record(account, opened.status, { error: opened.text?.slice(0, 200) });
+          res.write(`data: {"error":"upstream_error","status":${opened.status}}\n\n`);
+          res.write('data: [DONE]\n\n');
+          return res.end();
         }
-        if (result.status >= 500) {
-          // CF server error — cooldown and retry
-          log.warn(`Account ${account.name} stream -> ${result.status}: ${result.text?.slice(0, 200)}`);
-          record(account, result.status, { error: result.text?.slice(0, 200) });
-          pool.markError(account.id);
-          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
-          continue;
-        }
-        if (result.status >= 400) {
-          // Client error (400/401/404/etc) — return immediately, retrying won't help
-          log.warn(`Account ${account.name} stream -> ${result.status}: ${result.text?.slice(0, 200)}`);
-          record(account, result.status, { error: result.text?.slice(0, 200) });
-          return res.status(result.status).type('application/json').send(result.text);
-        }
+
+        const writeChunk = (chunk) => {
+          if (chunk && chunk.length) realDataStarted = true;
+          if (!res.write(chunk)) return new Promise((r) => res.once('drain', r));
+        };
+        const { usage } = await pumpStream(opened.stream, writeChunk);
+        clearInterval(heartbeat);
         log.info(`Account ${account.name} stream -> 200 (attempt ${attempt + 1})`);
-        record(account, 200, { usage: result.usage });
-        pool.markSuccess(account.id, model, result.usage);
+        record(account, 200, { usage });
+        pool.markSuccess(account.id, model, usage);
         lastSuccessAt = new Date().toISOString();
         return res.end();
       }
@@ -430,23 +419,34 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// OpenAI: /v1/models
-app.get('/v1/models', (_req, res) => {
-  const stats = pool.stats();
-  // Return a basic model list (live CF list would require a working account)
-  res.json({
-    object: 'list',
-    data: [
-      { id: '@cf/meta/llama-3.3-70b-instruct-fp8-fast', object: 'model', owned_by: 'cloudflare' },
-      { id: '@cf/meta/llama-3.1-8b-instruct-fp8-fast', object: 'model', owned_by: 'cloudflare' },
-      { id: '@cf/moonshotai/kimi-k2.7-code', object: 'model', owned_by: 'cloudflare' },
-      { id: '@cf/moonshotai/kimi-k2.6', object: 'model', owned_by: 'cloudflare' },
-      { id: '@cf/zai-org/glm-5.2', object: 'model', owned_by: 'cloudflare' },
-      { id: '@cf/meta/llama-3.2-1b-instruct', object: 'model', owned_by: 'cloudflare' },
-      { id: '@cf/meta/llama-3.2-3b-instruct', object: 'model', owned_by: 'cloudflare' },
-      { id: '@cf/mistralai/mistral-small-3.1-24b-instruct', object: 'model', owned_by: 'cloudflare' },
-    ],
-  });
+// OpenAI: /v1/models — live from CF API
+app.get('/v1/models', async (_req, res) => {
+  try {
+    const models = await getModels(pickAccount, log.warn);
+    res.json({
+      object: 'list',
+      data: models.map((m) => {
+        const i = m.id.lastIndexOf('/');
+        const short = i >= 0 ? m.id.slice(i + 1) : m.id;
+        return { id: m.id, short, object: 'model', owned_by: 'cloudflare' };
+      }),
+    });
+  } catch (e) {
+    log.error(`/v1/models failed: ${e.message}`);
+    res.status(502).json({ error: 'Failed to fetch model list' });
+  }
+});
+
+// Admin: /api/models — raw with metadata
+app.get('/api/models', async (req, res) => {
+  try {
+    const fresh = req.query.fresh === '1';
+    const models = await getModels(pickAccount, log.warn, { fresh });
+    res.json({ models, count: models.length, cached: !fresh });
+  } catch (e) {
+    log.error(`/api/models failed: ${e.message}`);
+    res.status(502).json({ error: 'Failed to fetch model list' });
+  }
 });
 
 // OpenAI: /v1/chat/completions
@@ -456,7 +456,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (!body.model) return res.status(400).json({ error: 'model required' });
 
   const clientRequest = captureBody(body);
-  const r = resolveModel(body.model);
+  const r = await resolveModel(body.model);
   if (r.error) return res.status(r.status).json({ error: r.error });
   body.model = r.id;
   if (Array.isArray(body.messages)) body.messages = flattenContent(body.messages);
@@ -479,7 +479,7 @@ app.post('/v1/embeddings', async (req, res) => {
   if (!body.model) return res.status(400).json({ error: 'model required' });
 
   const clientRequest = captureBody(body);
-  const r = resolveModel(body.model);
+  const r = await resolveModel(body.model);
   if (r.error) return res.status(r.status).json({ error: r.error });
   body.model = r.id;
 
@@ -500,7 +500,7 @@ app.post('/ai/run/*', async (req, res) => {
   if (!model) return res.status(400).json({ error: 'model required in path' });
   const body = req.body ?? {};
   const clientRequest = captureBody({ model, ...body });
-  const r = resolveModel(model);
+  const r = await resolveModel(model);
   if (r.error) return res.status(r.status).json({ error: r.error });
 
   return withPool({
