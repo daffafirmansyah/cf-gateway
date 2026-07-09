@@ -335,6 +335,11 @@
         <div class="stat-label">Requests</div>
         <div id="stat-requests" class="stat-value text-pink-400">—</div>
       </div>
+      <div class="stat-card fade-up">
+        <div class="stat-icon" style="background:rgba(239,68,68,.1);color:#f87171;">☠</div>
+        <div class="stat-label">Exhausted</div>
+        <div id="stat-exhausted" class="stat-value text-red-400">—</div>
+      </div>
     </div>
 
     <!-- Neuron Usage Bar -->
@@ -345,6 +350,17 @@
       </div>
       <div class="bar-bg" style="height:10px;">
         <div id="neuron-bar" class="bar-fill" style="width:0%; background:linear-gradient(90deg,#3b82f6,#8b5cf6);"></div>
+      </div>
+    </div>
+
+    <!-- Exhausted Ratio Bar -->
+    <div class="glass-sm p-5 mb-6 fade-up">
+      <div class="flex justify-between items-center mb-3">
+        <span style="font-size:13px; font-weight:600; color:#94a3b8;">Account Exhaustion</span>
+        <span id="exhausted-pct" style="font-size:12px; color:#64748b; font-family:monospace;">—</span>
+      </div>
+      <div class="bar-bg" style="height:10px;">
+        <div id="exhausted-bar" class="bar-fill" style="width:0%; background:linear-gradient(90deg,#f87171,#dc2626);"></div>
       </div>
     </div>
 
@@ -546,6 +562,7 @@
       document.getElementById('stat-total').textContent = stats.total ?? '—';
       document.getElementById('stat-available').textContent = stats.available ?? '—';
       document.getElementById('stat-cooldown').textContent = stats.cooldown ?? '—';
+      document.getElementById('stat-exhausted').textContent = stats.exhausted ?? '—';
       document.getElementById('stat-neurons-used').textContent = formatNum(stats.neurons_used_today ?? 0);
       document.getElementById('stat-neurons-remaining').textContent = formatNum(stats.neurons_remaining_today ?? 0);
       document.getElementById('stat-requests').textContent = stats.requests_today ?? '—';
@@ -554,6 +571,13 @@
       const pct = Math.min(100, (used/cap)*100).toFixed(1);
       document.getElementById('neuron-pct').textContent = `${formatNum(used)} / ${formatNum(cap)} (${pct}%)`;
       document.getElementById('neuron-bar').style.width = pct + '%';
+      const exTotal = stats.total || 1;
+      const exUsed = stats.exhausted || 0;
+      const exPct = Math.min(100, (exUsed/exTotal)*100).toFixed(1);
+      document.getElementById('exhausted-pct').textContent = `${exUsed} / ${exTotal} (${exPct}%)`;
+      const exBar = document.getElementById('exhausted-bar');
+      exBar.style.width = exPct + '%';
+      exBar.style.background = exPct > 50 ? 'linear-gradient(90deg,#7f1d1d,#dc2626)' : exPct > 25 ? 'linear-gradient(90deg,#f87171,#dc2626)' : 'linear-gradient(90deg,#fbbf24,#f87171)';
     }
 
     function renderLogs() {
