@@ -112,6 +112,37 @@ async function doProbe() {
 }
 setInterval(doProbe, PROBE_INTERVAL_MS);
 
+// --- Nightly reset --- clear per-day counters at 00:00 UTC
+function scheduleNightlyReset() {
+  const now = new Date();
+  const tomorrow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const msUntilMidnight = tomorrow - now;
+
+  setTimeout(() => {
+    doNightlyReset();
+    setInterval(doNightlyReset, 24 * 60 * 60 * 1000);
+  }, msUntilMidnight);
+}
+
+function doNightlyReset() {
+  const today = todayUTC();
+  const stmt = db.prepare(
+    `UPDATE accounts
+     SET neurons_today = 0, neurons_day = ?, requests_today = 0,
+         cooldown_until = 0, error_count = 0, backoff_level = 0, last_error_at = 0
+     WHERE is_active = 1`
+  );
+  const result = stmt.run(today);
+  // Clear all per-model locks
+  db.prepare('DELETE FROM model_locks').run();
+  // Clear in-flight reservations
+  pool._reserved.clear();
+  pool._reservedDay = today;
+  log.info(`nightly reset: ${result.changes} accounts reset for ${today}; model locks cleared`);
+}
+
+scheduleNightlyReset();
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
