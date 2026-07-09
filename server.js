@@ -344,9 +344,12 @@ app.get('/health', (_req, res) => {
       cooldown: stats.cooldown,
       exhausted: stats.exhausted,
       inactive: stats.inactive,
+      exhausted_ratio: stats.exhausted_ratio,
+      used_ratio: stats.used_ratio,
     },
     neurons: {
       used_today: stats.neurons_used_today,
+      used_ratio: stats.used_ratio,
       capacity_today: stats.neurons_capacity_today,
       remaining_today: stats.neurons_remaining_today,
     },
