@@ -203,6 +203,11 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
       return res.status(503).json({ error: 'CF capacity exhausted', pool: pool.stats() });
     }
 
+    // Hard capacity stop: global CF overload, wait briefly before next account
+    if (consecutiveCapacityErrors >= 3 && attempt < MAX_RETRIES - 1) {
+      await sleep(2000 + Math.floor(Math.random() * 1000));
+    }
+
     const account = pool.getAvailable(model);
     if (!account) {
       record(null, 503, { error: 'No available accounts' });
@@ -276,7 +281,7 @@ async function _withPoolInner({ res, buildUrl, body, stream, model, endpoint, cl
           // No delay for capacity errors, immediately try next
         } else {
           consecutiveCapacityErrors = 0;
-          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS);
+          if (attempt < MAX_RETRIES - 1) await sleep(RETRY_DELAY_MS + Math.floor(Math.random() * 300));
         }
         continue;
       }
